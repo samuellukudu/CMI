@@ -321,8 +321,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--mask_ratio", type=float, default=0.65, 
                         help="Mask ratio for sensor data (0.5-0.8)")
-    parser.add_argument("--loss_type", choices=["mae", "huber"], default="mae",
-                        help="Loss function type")
+    parser.add_argument("--loss_type", choices=["mae", "huber", "conf_mse"], default="mae",
+                        help="Loss function type (mae, huber, conf_mse)")
     parser.add_argument("--huber_beta", type=float, default=1.0,
                         help="Beta parameter for Huber loss")
     args = parser.parse_args()

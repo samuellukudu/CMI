@@ -151,6 +151,12 @@ class MaskedImputer(nn.Module):
         # Adaptive pooling to ensure exact output size
         self.tof_adaptive_pool = nn.AdaptiveAvgPool1d(self.cfg.tof_out_dim)
 
+        # -------- confidence-aware uncertainty parameters --------
+        if self.cfg.loss_type == "conf_mse":
+            # Learnable log variance parameters for THM and TOF heads
+            self.log_var_thm = nn.Parameter(torch.zeros(()))
+            self.log_var_tof = nn.Parameter(torch.zeros(()))
+
     # ---------------------------------------------------------------------
     #  Forward + loss
     # ---------------------------------------------------------------------
@@ -210,6 +216,30 @@ class MaskedImputer(nn.Module):
         thm_pred, tof_pred = preds
         thm_tgt, tof_tgt = targets
         thm_mask, tof_mask = masks  # 0/1 floats (1 => was masked)
+
+        # Confidence-aware MSE loss branch
+        if self.cfg.loss_type == "conf_mse":
+            mse_fn = nn.MSELoss(reduction="none")
+
+            def _masked_mse(pred: torch.Tensor, tgt: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+                mse = mse_fn(pred, tgt) * m
+                denom = m.sum().clamp(min=1.0)
+                return mse.sum() / denom
+
+            mse_thm = _masked_mse(thm_pred, thm_tgt, thm_mask)
+            mse_tof = _masked_mse(tof_pred, tof_tgt, tof_mask)
+
+            var_thm = torch.exp(self.log_var_thm)
+            var_tof = torch.exp(self.log_var_tof)
+
+            loss_thm = 0.5 * mse_thm / var_thm + 0.5 * self.log_var_thm
+            loss_tof = 0.5 * mse_tof / var_tof + 0.5 * self.log_var_tof
+
+            # Balance contributions by inverse output dims
+            w_thm = 1.0 / thm_pred.size(-1)
+            w_tof = 1.0 / tof_pred.size(-1)
+            total_loss = w_thm * loss_thm + w_tof * loss_tof
+            return total_loss, loss_thm.item(), loss_tof.item()
 
         # Choose loss function based on configuration
         if self.cfg.loss_type == "huber":
