@@ -45,9 +45,14 @@ class MaskedImputerConfig:
     tof_out_dim: int = 320  # 5×8×8 flattened grid default
     
     # TOF transposed conv decoder
-    tof_conv_channels: Sequence[int] = field(default_factory=lambda: [128, 64, 32])  # Reverse of encoder
+    # Increased depth for richer feature hierarchy in the TOF decoder
+    tof_conv_channels: Sequence[int] = field(default_factory=lambda: [256, 128, 64, 32])  # Reverse of encoder
     tof_initial_length: int = 10  # Initial sequence length for TOF decoder
     tof_upsample_factor: int = 2  # Upsampling factor per layer
+
+    # Loss configuration
+    loss_type: str = "mae"  # options: "mae", "huber"
+    huber_beta: float = 1.0  # delta parameter for Huber/SmoothL1 loss
 
     # Regularisation
     dropout: float = 0.2
@@ -191,26 +196,42 @@ class MaskedImputer(nn.Module):
     #  Masked reconstruction loss
     # ------------------------------------------------------------------
 
-    @staticmethod
     def reconstruction_loss(
+        self,
         preds: Tuple[torch.Tensor, torch.Tensor],
         targets: Tuple[torch.Tensor, torch.Tensor],
         masks: Tuple[torch.Tensor, torch.Tensor],
-    ) -> torch.Tensor:
-        """Compute MAE on masked positions only."""
+    ) -> Tuple[torch.Tensor, float, float]:
+        """Compute loss on masked positions only.
+        
+        Returns:
+            Tuple of (total_loss, thm_loss_item, tof_loss_item)
+        """
         thm_pred, tof_pred = preds
         thm_tgt, tof_tgt = targets
         thm_mask, tof_mask = masks  # 0/1 floats (1 => was masked)
 
-        def _masked_mae(pred: torch.Tensor, tgt: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-            mae = torch.abs(pred - tgt) * m
+        # Choose loss function based on configuration
+        if self.cfg.loss_type == "huber":
+            criterion = nn.SmoothL1Loss(beta=self.cfg.huber_beta, reduction="none")
+        else:
+            criterion = nn.L1Loss(reduction="none")
+
+        def _masked_loss(pred: torch.Tensor, tgt: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+            loss = criterion(pred, tgt) * m
             # Avoid division by zero
             denom = m.sum().clamp(min=1.0)
-            return mae.sum() / denom
+            return loss.sum() / denom
 
-        loss_thm = _masked_mae(thm_pred, thm_tgt, thm_mask)
-        loss_tof = _masked_mae(tof_pred, tof_tgt, tof_mask)
-        return loss_thm + loss_tof
+        loss_thm = _masked_loss(thm_pred, thm_tgt, thm_mask)
+        loss_tof = _masked_loss(tof_pred, tof_tgt, tof_mask)
+
+        # Balance contributions by scaling with inverse output dimensions
+        w_thm = 1.0 / thm_pred.size(-1)  # 1 / 17
+        w_tof = 1.0 / tof_pred.size(-1)  # 1 / 320
+        total_loss = w_thm * loss_thm + w_tof * loss_tof
+        
+        return total_loss, loss_thm.item(), loss_tof.item()
 
     # ------------------------------------------------------------------
     #  Helpers

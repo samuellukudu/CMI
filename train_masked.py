@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
+import gc
 from pathlib import Path
 from typing import Tuple, Dict
 
@@ -15,6 +17,32 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm, trange
+
+# -------------------------------------------------------------
+#  Reproducibility & memory helpers
+# -------------------------------------------------------------
+
+def seeding(seed: int) -> None:
+    """Global deterministic behaviour for reproducibility."""
+    np.random.seed(seed)
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = False  # allows faster convs
+        torch.backends.cudnn.benchmark = True
+    print(f"Seeding done with seed={seed}")
+
+
+def flush() -> None:
+    """Release cached GPU memory to mitigate OOM between folds."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
 from masked_dataset import SensorMaskedDataset
@@ -165,7 +193,7 @@ def train_fold(
             thm_pred, tof_pred = model(imu_batch)
             
             # Calculate loss (only on masked positions)
-            loss = model.reconstruction_loss(
+            loss, thm_loss_item, tof_loss_item = model.reconstruction_loss(
                 (thm_pred, tof_pred),
                 (thm_target, tof_target),
                 (thm_mask, tof_mask)
@@ -180,11 +208,9 @@ def train_fold(
             running_loss += loss.item() * batch_size
             n_samples += batch_size
             
-            # Calculate component losses for reporting
-            thm_loss = (torch.abs(thm_pred - thm_target) * thm_mask).sum() / thm_mask.sum().clamp(min=1.0)
-            tof_loss = (torch.abs(tof_pred - tof_target) * tof_mask).sum() / tof_mask.sum().clamp(min=1.0)
-            running_thm_loss += thm_loss.item() * batch_size
-            running_tof_loss += tof_loss.item() * batch_size
+            # Track component losses (already computed in reconstruction_loss)
+            running_thm_loss += thm_loss_item * batch_size
+            running_tof_loss += tof_loss_item * batch_size
 
         # Compute epoch metrics
         train_loss = running_loss / n_samples
@@ -211,7 +237,7 @@ def train_fold(
                 thm_pred, tof_pred = model(imu_batch)
                 
                 # Calculate loss
-                loss = model.reconstruction_loss(
+                loss, thm_loss_item, tof_loss_item = model.reconstruction_loss(
                     (thm_pred, tof_pred),
                     (thm_target, tof_target),
                     (thm_mask, tof_mask)
@@ -222,11 +248,9 @@ def train_fold(
                 val_running_loss += loss.item() * batch_size
                 val_n_samples += batch_size
                 
-                # Calculate component losses
-                thm_loss = (torch.abs(thm_pred - thm_target) * thm_mask).sum() / thm_mask.sum().clamp(min=1.0)
-                tof_loss = (torch.abs(tof_pred - tof_target) * tof_mask).sum() / tof_mask.sum().clamp(min=1.0)
-                val_running_thm_loss += thm_loss.item() * batch_size
-                val_running_tof_loss += tof_loss.item() * batch_size
+                # Track component losses (already computed in reconstruction_loss)
+                val_running_thm_loss += thm_loss_item * batch_size
+                val_running_tof_loss += tof_loss_item * batch_size
 
         # Compute validation metrics
         val_loss = val_running_loss / val_n_samples
@@ -294,13 +318,21 @@ def main():
     else:
         default_device = "cpu"
     parser.add_argument("--device", type=str, default=default_device)
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--mask_ratio", type=float, default=0.65, 
                         help="Mask ratio for sensor data (0.5-0.8)")
+    parser.add_argument("--loss_type", choices=["mae", "huber"], default="mae",
+                        help="Loss function type")
+    parser.add_argument("--huber_beta", type=float, default=1.0,
+                        help="Beta parameter for Huber loss")
     args = parser.parse_args()
     
     # Validate mask_ratio
-    if not (0.5 <= args.mask_ratio <= 0.8):
-        raise ValueError(f"mask_ratio must be between 0.5 and 0.8, got {args.mask_ratio}")
+    if not (0.15 <= args.mask_ratio <= 0.8):
+        raise ValueError(f"mask_ratio must be between 0.15 and 0.8, got {args.mask_ratio}")
+
+    # Set random seed
+    seeding(args.seed)
 
     # Load data
     print("Loading preprocessed data...")
@@ -311,6 +343,8 @@ def main():
         in_channels_imu=imu.shape[1],
         thm_out_dim=thm.shape[1],
         tof_out_dim=tof.shape[1],
+        loss_type=args.loss_type,
+        huber_beta=args.huber_beta,
     )
     print(f"Model configuration: {cfg}")
 
@@ -324,6 +358,8 @@ def main():
             mask_ratio=args.mask_ratio,
         )
         results.append(metrics)
+        # Flush GPU memory between folds
+        flush()
 
     # Print cross-validation results
     print("\n===== Cross-validation Results =====")
