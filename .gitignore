@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+.env
+venv/
+logs/
+checkpoints/
+inputs/
+preprocessed/
+*.csv
+*.pth
