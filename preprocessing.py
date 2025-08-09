@@ -35,6 +35,27 @@ def get_feature_columns(df: pl.DataFrame) -> Tuple[List[str], List[str], List[st
     tof_cols = [col for col in df.columns if col.startswith("tof_")]
     return imu_cols, thm_cols, tof_cols
 
+# 3. Generate Observed Masks (before filling missing values)
+def generate_observed_masks(df: pl.DataFrame, thm_cols: List[str], tof_cols: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate observed/missing masks before imputation.
+    Returns binary masks where 1 = observed, 0 = missing.
+    """
+    thm_observed = np.ones((df.shape[0], len(thm_cols)), dtype=np.float32)
+    tof_observed = np.ones((df.shape[0], len(tof_cols)), dtype=np.float32)
+    
+    # THM: missing values are null/NaN
+    for i, col in enumerate(thm_cols):
+        col_data = df[col].to_numpy()
+        thm_observed[:, i] = (~np.isnan(col_data)).astype(np.float32)
+    
+    # TOF: missing values are -1
+    for i, col in enumerate(tof_cols):
+        col_data = df[col].to_numpy()
+        tof_observed[:, i] = (col_data != -1).astype(np.float32)
+    
+    return thm_observed, tof_observed
+
 # 3. Fill Missing Values
 def fill_missing_thm(df: pl.DataFrame, thm_cols: List[str]) -> pl.DataFrame:
     for col in thm_cols:
@@ -286,6 +307,11 @@ def save_preprocessing_outputs(data: dict, out_dir: str = PREPROCESSED_DIR):
     np.save(os.path.join(out_dir, 'test_thm.npy'), data['test_thm'])
     np.save(os.path.join(out_dir, 'train_tof.npy'), data['train_tof'])
     np.save(os.path.join(out_dir, 'test_tof.npy'), data['test_tof'])
+    # Save observed masks
+    np.save(os.path.join(out_dir, 'train_thm_observed.npy'), data['train_thm_observed'])
+    np.save(os.path.join(out_dir, 'train_tof_observed.npy'), data['train_tof_observed'])
+    np.save(os.path.join(out_dir, 'test_thm_observed.npy'), data['test_thm_observed'])
+    np.save(os.path.join(out_dir, 'test_tof_observed.npy'), data['test_tof_observed'])
     # Save scalers and cv_splits
     joblib.dump(data['imu_scaler'], os.path.join(out_dir, 'imu_scaler.joblib'))
     joblib.dump(data['thm_scaler'], os.path.join(out_dir, 'thm_scaler.joblib'))
@@ -311,6 +337,10 @@ def preprocess():
     test = downcast_dtypes(test)
 
     imu_cols, thm_cols, tof_cols = get_feature_columns(train)
+
+    # Generate observed masks BEFORE filling missing values
+    train_thm_observed, train_tof_observed = generate_observed_masks(train, thm_cols, tof_cols)
+    test_thm_observed, test_tof_observed = generate_observed_masks(test, thm_cols, tof_cols)
 
     # Fill missing values
     train = fill_missing_thm(train, thm_cols)
@@ -344,6 +374,12 @@ def preprocess():
         'thm_mean', 'thm_range', 'thm_std'
     ]
     thm_cols = thm_cols + [f for f in new_thm_features if f not in thm_cols]
+
+    # Align THM observed masks to final feature dimensionality (engineered feats are always observed)
+    extra_train = np.ones((train.shape[0], len(new_thm_features)), dtype=np.float32)
+    extra_test = np.ones((test.shape[0], len(new_thm_features)), dtype=np.float32)
+    train_thm_observed = np.concatenate([train_thm_observed, extra_train], axis=1)
+    test_thm_observed = np.concatenate([test_thm_observed, extra_test], axis=1)
 
     # Scale features
     train_imu, test_imu, imu_scaler = scale_features(train, test, imu_cols)
@@ -382,6 +418,10 @@ def preprocess():
         "test_thm": test_thm,
         "train_tof": train_tof,
         "test_tof": test_tof,
+        "train_thm_observed": train_thm_observed,
+        "train_tof_observed": train_tof_observed,
+        "test_thm_observed": test_thm_observed,
+        "test_tof_observed": test_tof_observed,
         "binary_cv_splits": binary_cv_splits,
         "binary_targets": binary_targets,
         "bfrb_cv_splits": bfrb_cv_splits,

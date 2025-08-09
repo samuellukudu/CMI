@@ -37,7 +37,10 @@ class MaskedImputerConfig:
     # Encoder
     in_channels_imu: int = 20  # IMU feature count
     conv_channels: Sequence[int] = field(default_factory=lambda: [32, 64, 128])
-    kernel_size: int = 3  # 1-D conv kernel (odd => length preserved)
+    kernel_size: int = 17  # 1-D conv kernel (odd => length preserved)
+
+    # Mask-aware conditioning (concatenate masked THM/TOF with IMU)
+    use_mask_conditioning: bool = False
 
     # Latent & decoders
     latent_dim: int = 256
@@ -50,9 +53,32 @@ class MaskedImputerConfig:
     tof_initial_length: int = 10  # Initial sequence length for TOF decoder
     tof_upsample_factor: int = 2  # Upsampling factor per layer
 
-    # Loss configuration
-    loss_type: str = "mae"  # options: "mae", "huber"
+    # Shared transformer decoder (optional)
+    transformer_nhead: int = 8
+    transformer_ffn_mult: int = 4
+
+    # Multi-task learning configuration
+    use_shared_decoder: bool = False  # Whether to use shared decoder layers
+    shared_decoder_layers: int = 2  # Number of shared decoder layers before branching
+    shared_decoder_depth: int = 3  # Depth of shared MLP trunk layers
+    use_task_attention: bool = True  # Cross-attention between THM and TOF tasks
+    
+    # Advanced loss configuration
+    loss_type: str = "adaptive_weighted"  # "mae", "huber", "adaptive_weighted", "gradient_cos", "uncertainty_weighted"
+    thm_loss_type: str | None = None  # Optional override for THM loss (defaults to loss_type)
+    tof_loss_type: str | None = None  # Optional override for TOF loss (defaults to loss_type)
     huber_beta: float = 1.0  # delta parameter for Huber/SmoothL1 loss
+    use_uncertainty_weighting: bool = True  # Learn uncertainty-based task weights
+    use_homoscedastic_uncertainty: bool = True  # Model output uncertainty
+    loss_temperature: float = 1.0  # Temperature for loss balancing
+    
+    # Adaptive loss weighting
+    adaptive_loss_alpha: float = 0.16  # Learning rate for loss weight adaptation
+    gradient_normalization: bool = True  # Enable gradient normalization
+    
+    # Cross-modal alignment
+    use_cross_modal_loss: bool = True  # Enable cross-modal consistency loss
+    cross_modal_weight: float = 0.1  # Weight for cross-modal loss
 
     # Regularisation
     dropout: float = 0.2
@@ -80,8 +106,11 @@ class MaskedImputer(nn.Module):
 
         # ----- encoder -----
         layers = []
-        in_c = self.cfg.in_channels_imu
-        pad = self.cfg.kernel_size // 2
+        # Determine input channel size based on mask-aware conditioning
+        self.input_channels = self.cfg.in_channels_imu + (
+            (self.cfg.thm_out_dim + self.cfg.tof_out_dim) if self.cfg.use_mask_conditioning else 0
+        )
+        in_c = self.input_channels
         for out_c in self.cfg.conv_channels:
             layers.append(ResNetSEBlock(in_c, out_c))
             layers.append(nn.Dropout(self.cfg.dropout))
@@ -91,22 +120,65 @@ class MaskedImputer(nn.Module):
         self.to_latent = nn.Linear(in_c, self.cfg.latent_dim)
 
         # ----- decoders -----
-        # THM decoder with 3 layers for better feature learning
-        self.decoder_thm = nn.Sequential(
-            nn.Linear(self.cfg.latent_dim, self.cfg.latent_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(self.cfg.dropout),
-            nn.Linear(self.cfg.latent_dim // 2, self.cfg.latent_dim // 4),
-            nn.ReLU(inplace=True),
-            nn.Dropout(self.cfg.dropout),
-            nn.Linear(self.cfg.latent_dim // 4, self.cfg.thm_out_dim),
-        )
-        
-        # TOF decoder using 1D transposed convolutions
-        self._build_tof_decoder()
+        if self.cfg.use_shared_decoder:
+            # Lightweight shared MLP trunk with task-specific heads
+            # Much more efficient than transformer decoder with 337 queries
+            shared_hidden = self.cfg.latent_dim // 2
+            
+            # Shared feature extraction trunk (configurable depth)
+            trunk_layers = [
+                nn.Linear(self.cfg.latent_dim, shared_hidden),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.cfg.dropout),
+            ]
+            for _ in range(max(1, self.cfg.shared_decoder_depth - 1)):
+                trunk_layers += [
+                    nn.Linear(shared_hidden, shared_hidden),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout(self.cfg.dropout),
+                ]
+            self.shared_trunk = nn.Sequential(*trunk_layers)
+            
+            # Task-specific heads (increase depth slightly for TOF)
+            self.decoder_thm = nn.Sequential(
+                nn.Linear(shared_hidden, shared_hidden // 2),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.cfg.dropout),
+                nn.Linear(shared_hidden // 2, self.cfg.thm_out_dim),
+            )
+            
+            self.decoder_tof = nn.Sequential(
+                nn.Linear(shared_hidden, shared_hidden),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.cfg.dropout),
+                nn.Linear(shared_hidden, shared_hidden // 2),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.cfg.dropout),
+                nn.Linear(shared_hidden // 2, self.cfg.tof_out_dim),
+            )
+        else:
+            # THM decoder with 3 layers for better feature learning
+            self.decoder_thm = nn.Sequential(
+                nn.Linear(self.cfg.latent_dim, self.cfg.latent_dim // 2),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.cfg.dropout),
+                nn.Linear(self.cfg.latent_dim // 2, self.cfg.latent_dim // 4),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.cfg.dropout),
+                nn.Linear(self.cfg.latent_dim // 4, self.cfg.thm_out_dim),
+            )
+            
+            # TOF decoder using 1D transposed convolutions
+            self._build_tof_decoder()
 
         self._init_weights()
-    
+
+        # -------- confidence-aware uncertainty parameters --------
+        if self.cfg.loss_type in ["conf_mse", "conf_mae", "conf_huber", "uncertainty_weighted"]:
+            # Learnable log variance/scale parameters for THM and TOF heads
+            self.log_var_thm = nn.Parameter(torch.zeros(()))
+            self.log_var_tof = nn.Parameter(torch.zeros(()))
+
     def _build_tof_decoder(self) -> None:
         """Build TOF decoder using 1D transposed convolutions."""
         # Project latent to initial conv feature map
@@ -151,24 +223,52 @@ class MaskedImputer(nn.Module):
         # Adaptive pooling to ensure exact output size
         self.tof_adaptive_pool = nn.AdaptiveAvgPool1d(self.cfg.tof_out_dim)
 
-        # -------- confidence-aware uncertainty parameters --------
-        if self.cfg.loss_type == "conf_mse":
-            # Learnable log variance parameters for THM and TOF heads
-            self.log_var_thm = nn.Parameter(torch.zeros(()))
-            self.log_var_tof = nn.Parameter(torch.zeros(()))
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv1d, nn.ConvTranspose1d)):
+                nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5)) if hasattr(nn.init, 'kaiming_uniform_') else None
+                if m.bias is not None:
+                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(m.bias, -bound, bound)
+        # Init shared query embeddings if present
+        if hasattr(self, 'shared_query_embed'):
+            nn.init.normal_(self.shared_query_embed, mean=0.0, std=0.02)
 
     # ---------------------------------------------------------------------
     #  Forward + loss
     # ---------------------------------------------------------------------
 
-    def forward(self, imu: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:  # noqa: D401
-        """Return predicted (thm, tof)."""
-        # Accept (B, C) or (B, C, L)
-        if imu.dim() == 2:
-            imu = imu.unsqueeze(-1)  # (B, C, 1)
-        z = self.encoder(imu)               # (B, C*, L)
+    def forward(self, imu: torch.Tensor, thm_input: torch.Tensor | None = None, tof_input: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor]:  # noqa: D401
+        """Return predicted (thm, tof).
+        If cfg.use_mask_conditioning is True, expects thm_input and tof_input (masked copies).
+        """
+        # Prepare input features
+        if self.cfg.use_mask_conditioning:
+            if thm_input is None or tof_input is None:
+                raise ValueError("use_mask_conditioning=True but thm_input/tof_input not provided")
+            # Accept (B, C) or (B, C, L) for each; unify to (B, C, L)
+            if imu.dim() == 2:
+                imu = imu.unsqueeze(-1)
+            if thm_input.dim() == 2:
+                thm_input = thm_input.unsqueeze(-1)
+            if tof_input.dim() == 2:
+                tof_input = tof_input.unsqueeze(-1)
+            x = torch.cat([imu, thm_input, tof_input], dim=1)
+        else:
+            # Accept (B, C) or (B, C, L)
+            x = imu if imu.dim() == 3 else imu.unsqueeze(-1)
+
+        z = self.encoder(x)               # (B, C*, L)
         z = self.global_pool(z).squeeze(-1)  # (B, C*)
         z = self.to_latent(z)               # (B, latent)
+        
+        if self.cfg.use_shared_decoder:
+            # Shared MLP trunk
+            shared_feat = self.shared_trunk(z)  # (B, shared_hidden)
+            thm_pred = self.decoder_thm(shared_feat)
+            tof_pred = self.decoder_tof(shared_feat)
+            return thm_pred, tof_pred
         
         # THM prediction (unchanged)
         thm_pred = self.decoder_thm(z)      # (B, thm_out_dim)
@@ -187,20 +287,13 @@ class MaskedImputer(nn.Module):
         tof_conv_out = self.decoder_tof(tof_features)  # (B, 1, upsampled_length)
         
         # Ensure exact output dimensions and flatten
-        # Handle MPS device limitation with adaptive pooling
         if tof_conv_out.device.type == 'mps' and tof_conv_out.size(-1) % self.cfg.tof_out_dim != 0:
-            # Fallback: use interpolation for MPS when sizes aren't divisible
-            tof_pred = F.interpolate(tof_conv_out, size=self.cfg.tof_out_dim, mode='linear', align_corners=False)
-            tof_pred = tof_pred.squeeze(1)  # (B, tof_out_dim)
+            tof_out = F.interpolate(tof_conv_out, size=self.cfg.tof_out_dim, mode='linear', align_corners=False)
         else:
-            tof_pred = self.tof_adaptive_pool(tof_conv_out)  # (B, 1, tof_out_dim)
-            tof_pred = tof_pred.squeeze(1)  # (B, tof_out_dim)
+            tof_out = self.tof_adaptive_pool(tof_conv_out)
         
+        tof_pred = tof_out.squeeze(1)  # (B, tof_out_dim)
         return thm_pred, tof_pred
-
-    # ------------------------------------------------------------------
-    #  Masked reconstruction loss
-    # ------------------------------------------------------------------
 
     def reconstruction_loss(
         self,
@@ -217,49 +310,108 @@ class MaskedImputer(nn.Module):
         thm_tgt, tof_tgt = targets
         thm_mask, tof_mask = masks  # 0/1 floats (1 => was masked)
 
-        # Confidence-aware MSE loss branch
-        if self.cfg.loss_type == "conf_mse":
-            mse_fn = nn.MSELoss(reduction="none")
+        # Determine per-task loss types (allow overrides)
+        thm_loss_type = (self.cfg.thm_loss_type or self.cfg.loss_type).lower()
+        tof_loss_type = (self.cfg.tof_loss_type or self.cfg.loss_type).lower()
 
-            def _masked_mse(pred: torch.Tensor, tgt: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-                mse = mse_fn(pred, tgt) * m
+        # Helper to get criterion by name
+        def get_criterion(name: str):
+            if name == "huber":
+                return nn.SmoothL1Loss(beta=self.cfg.huber_beta, reduction="none")
+            elif name == "mae":
+                return nn.L1Loss(reduction="none")
+            elif name == "mse":
+                return nn.MSELoss(reduction="none")
+            else:
+                # For composite types, base criterion will be MAE; combination handled later
+                return nn.L1Loss(reduction="none")
+
+        # Base masked loss (without composite weighting)
+        def masked_loss_with(criterion, pred, tgt, m):
+            loss = criterion(pred, tgt) * m
+            denom = m.sum().clamp(min=1.0)
+            return loss.sum() / denom
+
+        # Compute base per-task losses
+        base_loss_thm = masked_loss_with(get_criterion(thm_loss_type), thm_pred, thm_tgt, thm_mask)
+        base_loss_tof = masked_loss_with(get_criterion(tof_loss_type), tof_pred, tof_tgt, tof_mask)
+
+        loss_thm = base_loss_thm
+        loss_tof = base_loss_tof
+
+        # Advanced loss weighting strategies (by global loss_type)
+        lt = self.cfg.loss_type
+        if lt == "uncertainty_weighted":
+            precision_thm = torch.exp(-self.log_var_thm)
+            precision_tof = torch.exp(-self.log_var_tof)
+            weighted_loss_thm = precision_thm * loss_thm + self.log_var_thm
+            weighted_loss_tof = precision_tof * loss_tof + self.log_var_tof
+            total_loss = weighted_loss_thm + weighted_loss_tof
+        elif lt == "adaptive_weighted":
+            if not hasattr(self, 'task_weights'):
+                self.task_weights = nn.Parameter(torch.tensor([1.0, 1.0], requires_grad=True))
+            weights = F.softmax(self.task_weights, dim=0) * 2.0
+            total_loss = weights[0] * loss_thm + weights[1] * loss_tof
+        elif lt == "gradient_cos":
+            if self.training:
+                loss_thm.backward(retain_graph=True)
+                grad_thm = []
+                for p in self.parameters():
+                    if p.grad is not None:
+                        grad_thm.append(p.grad.clone().flatten())
+                self.zero_grad()
+                loss_tof.backward(retain_graph=True)
+                grad_tof = []
+                for p in self.parameters():
+                    if p.grad is not None:
+                        grad_tof.append(p.grad.clone().flatten())
+                self.zero_grad()
+                if grad_thm and grad_tof:
+                    gthm = torch.cat(grad_thm)
+                    gtof = torch.cat(grad_tof)
+                    cos_sim = F.cosine_similarity(gthm, gtof, dim=0)
+                    alpha = 0.5 + 0.3 * cos_sim
+                    beta = 1.0 - alpha
+                    total_loss = alpha * loss_thm + beta * loss_tof
+                else:
+                    total_loss = 0.5 * loss_thm + 0.5 * loss_tof
+            else:
+                total_loss = 0.5 * loss_thm + 0.5 * loss_tof
+        elif lt.startswith("conf_"):
+            base_name = lt[5:]
+            # choose error fn
+            if base_name == "mse":
+                error_fn = nn.MSELoss(reduction="none")
+                def u_loss(e, lv):
+                    var = torch.exp(lv)
+                    return 0.5 * e / var + 0.5 * lv
+            elif base_name == "mae":
+                error_fn = nn.L1Loss(reduction="none")
+                def u_loss(e, lv):
+                    b = torch.exp(lv)
+                    return e / b + lv + 0.693
+            else:  # huber
+                beta = self.cfg.huber_beta
+                error_fn = nn.SmoothL1Loss(beta=beta, reduction="none")
+                def u_loss(e, lv):
+                    scale = torch.exp(lv)
+                    return e / scale + lv
+            def masked_error(pred, tgt, m):
+                err = error_fn(pred, tgt) * m
                 denom = m.sum().clamp(min=1.0)
-                return mse.sum() / denom
-
-            mse_thm = _masked_mse(thm_pred, thm_tgt, thm_mask)
-            mse_tof = _masked_mse(tof_pred, tof_tgt, tof_mask)
-
-            var_thm = torch.exp(self.log_var_thm)
-            var_tof = torch.exp(self.log_var_tof)
-
-            loss_thm = 0.5 * mse_thm / var_thm + 0.5 * self.log_var_thm
-            loss_tof = 0.5 * mse_tof / var_tof + 0.5 * self.log_var_tof
-
-            # Balance contributions by inverse output dims
+                return err.sum() / denom
+            e_thm = masked_error(thm_pred, thm_tgt, thm_mask)
+            e_tof = masked_error(tof_pred, tof_tgt, tof_mask)
+            loss_thm = u_loss(e_thm, self.log_var_thm)
+            loss_tof = u_loss(e_tof, self.log_var_tof)
             w_thm = 1.0 / thm_pred.size(-1)
             w_tof = 1.0 / tof_pred.size(-1)
             total_loss = w_thm * loss_thm + w_tof * loss_tof
             return total_loss, loss_thm.item(), loss_tof.item()
-
-        # Choose loss function based on configuration
-        if self.cfg.loss_type == "huber":
-            criterion = nn.SmoothL1Loss(beta=self.cfg.huber_beta, reduction="none")
         else:
-            criterion = nn.L1Loss(reduction="none")
-
-        def _masked_loss(pred: torch.Tensor, tgt: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-            loss = criterion(pred, tgt) * m
-            # Avoid division by zero
-            denom = m.sum().clamp(min=1.0)
-            return loss.sum() / denom
-
-        loss_thm = _masked_loss(thm_pred, thm_tgt, thm_mask)
-        loss_tof = _masked_loss(tof_pred, tof_tgt, tof_mask)
-
-        # Balance contributions by scaling with inverse output dimensions
-        w_thm = 1.0 / thm_pred.size(-1)  # 1 / 17
-        w_tof = 1.0 / tof_pred.size(-1)  # 1 / 320
-        total_loss = w_thm * loss_thm + w_tof * loss_tof
+            w_thm = 1.0 / thm_pred.size(-1)
+            w_tof = 1.0 / tof_pred.size(-1)
+            total_loss = w_thm * loss_thm + w_tof * loss_tof
         
         return total_loss, loss_thm.item(), loss_tof.item()
 
@@ -273,6 +425,9 @@ class MaskedImputer(nn.Module):
                 nn.init.kaiming_uniform_(m.weight, mode=self.cfg.kaiming_mode, nonlinearity=self.cfg.kaiming_nonlin)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        # Initialize shared decoder query embeddings if present
+        if hasattr(self, 'shared_query_embed'):
+            nn.init.normal_(self.shared_query_embed, std=0.02)
 
 
 # ---------------------------------------------------------------------------
