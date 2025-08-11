@@ -357,9 +357,9 @@ def main():
         default_device = "cpu"
     parser.add_argument("--device", type=str, default=default_device)
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--mask_ratio", type=float, default=0.65, 
-                        help="Mask ratio for sensor data (0.5-0.8)")
-    parser.add_argument("--loss_type", choices=["mae", "mse", "huber", "conf_mse", "conf_mae", "conf_huber", "adaptive_weighted", "uncertainty_weighted", "gradient_cos"], default="mae",
+    parser.add_argument("--mask_ratio", type=float, default=0.50, 
+                        help="Mask ratio for sensor data (0.2-0.8)")
+    parser.add_argument("--loss_type", choices=["mae", "mse", "huber", "conf_mse", "conf_mae", "conf_huber", "adaptive_weighted", "uncertainty_weighted", "gradient_cos", "balanced_mse"], default="balanced_mse",
                         help="Type of reconstruction loss to use (global/combiner). Base per-task loss can be overridden.")
     parser.add_argument("--thm_loss_type", choices=["mae", "mse", "huber"], default=None,
                         help="Optional override for THM base loss type (per masked position).")
@@ -370,8 +370,7 @@ def main():
     parser.add_argument("--use_shared_decoder", action="store_true", help="Use shared MLP decoder trunk for THM and TOF")
     parser.add_argument("--shared_decoder_layers", type=int, default=2, help="Number of transformer decoder layers if using shared decoder")
     parser.add_argument("--shared_decoder_depth", type=int, default=3, help="Depth of shared MLP trunk layers")
-    parser.add_argument("--transformer_nhead", type=int, default=8, help="Number of attention heads in shared transformer decoder")
-    parser.add_argument("--transformer_ffn_mult", type=int, default=4, help="FFN dimension multiplier in transformer decoder")
+    
     parser.add_argument("--use_mask_conditioning", action="store_true", help="Concatenate masked THM/TOF inputs with IMU for conditioning")
     args = parser.parse_args()
     
@@ -398,8 +397,6 @@ def main():
         use_shared_decoder=args.use_shared_decoder,
         shared_decoder_layers=args.shared_decoder_layers,
         shared_decoder_depth=args.shared_decoder_depth,
-        transformer_nhead=args.transformer_nhead,
-        transformer_ffn_mult=args.transformer_ffn_mult,
         use_mask_conditioning=args.use_mask_conditioning,
     )
     print(f"Model configuration: {cfg}")
