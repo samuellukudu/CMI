@@ -1,6 +1,6 @@
 import polars as pl
 import numpy as np
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import StratifiedGroupKFold
 from typing import Tuple, List
 import os
@@ -41,18 +41,18 @@ def generate_observed_masks(df: pl.DataFrame, thm_cols: List[str], tof_cols: Lis
     Generate observed/missing masks before imputation.
     Returns binary masks where 1 = observed, 0 = missing.
     """
-    thm_observed = np.ones((df.shape[0], len(thm_cols)), dtype=np.float32)
-    tof_observed = np.ones((df.shape[0], len(tof_cols)), dtype=np.float32)
+    thm_observed = np.ones((df.shape[0], len(thm_cols)), dtype=bool)
+    tof_observed = np.ones((df.shape[0], len(tof_cols)), dtype=bool)
     
     # THM: missing values are null/NaN
     for i, col in enumerate(thm_cols):
         col_data = df[col].to_numpy()
-        thm_observed[:, i] = (~np.isnan(col_data)).astype(np.float32)
+        thm_observed[:, i] = ~np.isnan(col_data)
     
     # TOF: missing values are -1
     for i, col in enumerate(tof_cols):
         col_data = df[col].to_numpy()
-        tof_observed[:, i] = (col_data != -1).astype(np.float32)
+        tof_observed[:, i] = col_data != -1
     
     return thm_observed, tof_observed
 
@@ -234,8 +234,8 @@ def add_imu_features_polars(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 # 4. Data Transformation (Scaling)
-def scale_features(train: pl.DataFrame, test: pl.DataFrame, feature_cols: List[str]) -> Tuple[np.ndarray, np.ndarray, RobustScaler]:
-    scaler = RobustScaler()
+def scale_features(train: pl.DataFrame, test: pl.DataFrame, feature_cols: List[str]) -> Tuple[np.ndarray, np.ndarray, MinMaxScaler]:
+    scaler = MinMaxScaler()
     train_arr = train.select(feature_cols).to_numpy()
     test_arr = test.select(feature_cols).to_numpy()
     train_scaled = scaler.fit_transform(train_arr)
@@ -376,8 +376,8 @@ def preprocess():
     thm_cols = thm_cols + [f for f in new_thm_features if f not in thm_cols]
 
     # Align THM observed masks to final feature dimensionality (engineered feats are always observed)
-    extra_train = np.ones((train.shape[0], len(new_thm_features)), dtype=np.float32)
-    extra_test = np.ones((test.shape[0], len(new_thm_features)), dtype=np.float32)
+    extra_train = np.ones((train.shape[0], len(new_thm_features)), dtype=bool)
+    extra_test = np.ones((test.shape[0], len(new_thm_features)), dtype=bool)
     train_thm_observed = np.concatenate([train_thm_observed, extra_train], axis=1)
     test_thm_observed = np.concatenate([test_thm_observed, extra_test], axis=1)
 

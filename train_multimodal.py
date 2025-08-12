@@ -25,6 +25,7 @@ from tqdm.auto import tqdm, trange
 from multimodal_dataset import MultiSensorDataset
 from multimodal_model import MultiModalTransformerClassifier, MultiModalConfig
 from cmi_2025 import CompetitionMetric
+from utils import seeding, flush
 
 # -----------------------------------------------------------------------------
 #  Reproducibility & helpers
@@ -32,27 +33,6 @@ from cmi_2025 import CompetitionMetric
 
 ROOT = Path(__file__).parent
 PREP = ROOT / "preprocessed"
-
-
-def seeding(seed: int) -> None:  # noqa: D401
-    """Global deterministic behaviour for reproducibility."""
-    np.random.seed(seed)
-    random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
-
-
-def flush() -> None:  # noqa: D401
-    """Release cached GPU memory between folds."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
 
 
 # -----------------------------------------------------------------------------

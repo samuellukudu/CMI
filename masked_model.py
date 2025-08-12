@@ -47,6 +47,10 @@ class MaskedImputerConfig:
     latent_dim: int = 512  # Increased latent capacity
     thm_out_dim: int = 17
     tof_out_dim: int = 320  # 5×8×8 flattened grid default
+    imu_out_dim: int = 20  # IMU feature count (same as in_channels_imu)
+    # IMU loss configuration
+    imu_loss_type: str | None = None  # Optional override for IMU loss
+    imu_weight: float = 1.0
     
     # Simplified TOF decoder - no more transposed convs
     tof_hidden_dims: Sequence[int] = field(default_factory=lambda: [512, 256, 128])
@@ -56,6 +60,8 @@ class MaskedImputerConfig:
     shared_decoder_layers: int = 2  # Number of shared decoder layers before branching
     shared_decoder_depth: int = 3  # Depth of shared MLP trunk layers
     use_task_attention: bool = True  # Cross-attention between THM and TOF tasks
+    # UNet-style decoder (shared up-sampling trunk + heads)
+    use_unet_decoder: bool = False
     
     # Improved loss configuration with better balancing
     loss_type: str = "balanced_mse"  # New balanced approach
@@ -119,8 +125,22 @@ class MaskedImputer(nn.Module):
             nn.Dropout(self.cfg.dropout)
         )
 
-        # ----- Simplified decoders -----
-        if self.cfg.use_shared_decoder:
+        # ----- Decoders -----
+        if getattr(self.cfg, 'use_unet_decoder', False):
+            # Shared up-sampling trunk that maintains temporal resolution
+            self.upsample_trunk = nn.Sequential(
+                nn.Conv1d(in_c, in_c // 2, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.cfg.dropout),
+                nn.Conv1d(in_c // 2, in_c // 2, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.cfg.dropout),
+            )
+            trunk_c = in_c // 2
+            self.head_thm = nn.Conv1d(trunk_c, self.cfg.thm_out_dim, kernel_size=1)
+            self.head_tof = nn.Conv1d(trunk_c, self.cfg.tof_out_dim, kernel_size=1)
+            self.head_imu = nn.Conv1d(trunk_c, self.cfg.imu_out_dim, kernel_size=1)
+        elif self.cfg.use_shared_decoder:
             # Lightweight shared MLP trunk with task-specific heads
             shared_hidden = self.cfg.latent_dim // 2
 
@@ -148,6 +168,13 @@ class MaskedImputer(nn.Module):
                 nn.Dropout(self.cfg.dropout),
                 nn.Linear(shared_hidden, self.cfg.tof_out_dim),
             )
+            # IMU decoder head
+            self.decoder_imu = nn.Sequential(
+                nn.Linear(shared_hidden, shared_hidden // 2),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.cfg.dropout),
+                nn.Linear(shared_hidden // 2, self.cfg.imu_out_dim),
+            )
         else:
             # THM decoder - simple and effective
             self.decoder_thm = nn.Sequential(
@@ -172,6 +199,13 @@ class MaskedImputer(nn.Module):
                 in_dim = hidden_dim
             tof_layers.append(nn.Linear(in_dim, self.cfg.tof_out_dim))
             self.decoder_tof = nn.Sequential(*tof_layers)
+            # IMU decoder - mirrors THM branch
+            self.decoder_imu = nn.Sequential(
+                nn.Linear(self.cfg.latent_dim, self.cfg.latent_dim // 2),
+                nn.ReLU(inplace=True),
+                nn.Dropout(self.cfg.dropout),
+                nn.Linear(self.cfg.latent_dim // 2, self.cfg.imu_out_dim),
+            )
 
         self._init_weights()
 
@@ -181,14 +215,14 @@ class MaskedImputer(nn.Module):
             self.log_var_thm = nn.Parameter(torch.zeros(()))
             self.log_var_tof = nn.Parameter(torch.zeros(()))
 
-    def forward(self, imu: torch.Tensor, thm_input: torch.Tensor | None = None, tof_input: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor]:  # noqa: D401
+    def forward(self, imu: torch.Tensor, thm_input: torch.Tensor | None = None, tof_input: torch.Tensor | None = None, imu_input: torch.Tensor | None = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:  # noqa: D401
         """Return predicted (thm, tof).
         If cfg.use_mask_conditioning is True, expects thm_input and tof_input (masked copies).
         """
         # Prepare input features
         if self.cfg.use_mask_conditioning:
-            if thm_input is None or tof_input is None:
-                raise ValueError("use_mask_conditioning=True but thm_input/tof_input not provided")
+            if thm_input is None or tof_input is None or imu_input is None:
+                raise ValueError("use_mask_conditioning=True but thm_input/tof_input/imu_input not provided")
             # Accept (B, C) or (B, C, L) for each; unify to (B, C, L)
             if imu.dim() == 2:
                 imu = imu.unsqueeze(-1)
@@ -196,33 +230,42 @@ class MaskedImputer(nn.Module):
                 thm_input = thm_input.unsqueeze(-1)
             if tof_input.dim() == 2:
                 tof_input = tof_input.unsqueeze(-1)
-            x = torch.cat([imu, thm_input, tof_input], dim=1)
+            x = torch.cat([imu_input, thm_input, tof_input], dim=1)
         else:
             # Accept (B, C) or (B, C, L)
             x = imu if imu.dim() == 3 else imu.unsqueeze(-1)
 
-        z = self.encoder(x)               # (B, C*, L)
-        z = self.global_pool(z).squeeze(-1)  # (B, C*)
-        z = self.to_latent(z)               # (B, latent)
+        enc_feat = self.encoder(x)  # (B, C*, L)
+        # ---- UNet branch ----
+        if getattr(self.cfg, 'use_unet_decoder', False):
+            feat = self.upsample_trunk(enc_feat)  # (B, trunk_c, L)
+            thm_pred = self.head_thm(feat).mean(dim=-1)  # (B, thm_out)
+            tof_pred = self.head_tof(feat).mean(dim=-1)  # (B, tof_out)
+            imu_pred = self.head_imu(feat).mean(dim=-1)  # (B, imu_out)
+            return thm_pred, tof_pred, imu_pred
+        # ---- MLP branches ----
+        z = self.global_pool(enc_feat).squeeze(-1)  # (B, C*)
+        z = self.to_latent(z)  # (B, latent)
         
         if self.cfg.use_shared_decoder:
-            # Shared trunk
             shared_feat = self.shared_trunk(z)
             thm_pred = self.decoder_thm(shared_feat)
             tof_pred = self.decoder_tof(shared_feat)
-            return thm_pred, tof_pred
+            imu_pred = self.decoder_imu(shared_feat)
+            return thm_pred, tof_pred, imu_pred
         
         # Individual decoders
-        thm_pred = self.decoder_thm(z)      # (B, thm_out_dim)
-        tof_pred = self.decoder_tof(z)      # (B, tof_out_dim)
-        return thm_pred, tof_pred
+        thm_pred = self.decoder_thm(z)
+        tof_pred = self.decoder_tof(z)
+        imu_pred = self.decoder_imu(z)
+        return thm_pred, tof_pred, imu_pred
 
     def reconstruction_loss(
         self,
-        preds: Tuple[torch.Tensor, torch.Tensor],
-        targets: Tuple[torch.Tensor, torch.Tensor],
-        masks: Tuple[torch.Tensor, torch.Tensor],
-    ) -> Tuple[torch.Tensor, float, float]:
+        preds: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        targets: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        masks: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> Tuple[torch.Tensor, float, float, float]:
         """Compute loss on masked positions only with per-task criteria and balanced aggregation.
 
         Per-task base losses can be set via cfg.thm_loss_type and cfg.tof_loss_type
@@ -230,20 +273,20 @@ class MaskedImputer(nn.Module):
         loss inferred from cfg.loss_type (defaulting to 'mse' when the latter is
         an aggregator like 'balanced_mse' or 'adaptive_weighted').
         """
-        thm_pred, tof_pred = preds
-        thm_tgt, tof_tgt = targets
-        thm_mask, tof_mask = masks  # 0/1 floats (1 => was masked)
+        thm_pred, tof_pred, imu_pred = preds
+        thm_tgt, tof_tgt, imu_tgt = targets
+        thm_mask, tof_mask, imu_mask = masks  # 0/1 floats (1 => was masked)
 
         # Helper to compute masked loss
         def masked_loss(pred, tgt, mask, criterion):
             loss = criterion(pred, tgt)  # (B, features) or (B,)
-            # Ensure mask has compatible shape for broadcasting
-            if mask.dim() != loss.dim():
-                while mask.dim() < loss.dim():
-                    mask = mask.unsqueeze(-1)
-                mask = mask.expand_as(loss)
+            # Broadcast mask to match loss shape (faster & simpler)
+            if mask.shape != loss.shape:
+                mask = mask.view(*mask.shape, *([1] * (loss.dim() - mask.dim()))).expand_as(loss)
             masked_loss = loss * mask
-            valid_count = mask.sum().clamp(min=1.0)
+            valid_count = mask.sum()
+            if valid_count == 0:  # Edge-case: nothing was masked in this batch
+                return torch.tensor(0.0, device=loss.device)
             return masked_loss.sum() / valid_count
 
         # Map string to criterion (reduction='none')
@@ -267,10 +310,13 @@ class MaskedImputer(nn.Module):
 
         crit_thm = get_criterion(thm_base)
         crit_tof = get_criterion(tof_base)
+        imu_base = self.cfg.imu_loss_type.lower() if self.cfg.imu_loss_type else base_name
+        crit_imu = get_criterion(imu_base)
 
         # Compute per-task masked losses
         loss_thm = masked_loss(thm_pred, thm_tgt, thm_mask, crit_thm)
         loss_tof = masked_loss(tof_pred, tof_tgt, tof_mask, crit_tof)
+        loss_imu = masked_loss(imu_pred, imu_tgt, imu_mask, crit_imu)
 
         # Aggregation / balancing across tasks
         if self.cfg.loss_type in {"balanced_mse", "uncertainty_weighted"}:
@@ -283,25 +329,21 @@ class MaskedImputer(nn.Module):
                     precision_tof * loss_tof + self.log_var_tof
                 )
             else:
-                # Simple dimensionality balancing fallback
-                w_thm = 1.0 / self.cfg.thm_out_dim
-                w_tof = 1.0 / self.cfg.tof_out_dim
-                total_loss = w_thm * loss_thm + w_tof * loss_tof
+                # Unweighted sum – inputs are already min-max scaled
+                total_loss = loss_thm + loss_tof + self.cfg.imu_weight * loss_imu
 
         elif self.cfg.loss_type == "adaptive_weighted":
             # Learnable weights via softmax
             if not hasattr(self, 'task_weights'):
-                self.task_weights = nn.Parameter(torch.tensor([1.0, 1.0], requires_grad=True))
-            weights = F.softmax(self.task_weights, dim=0) * 2.0
-            total_loss = weights[0] * loss_thm + weights[1] * loss_tof
+                self.task_weights = nn.Parameter(torch.tensor([1.0, 1.0, 1.0], requires_grad=True))
+            weights = F.softmax(self.task_weights, dim=0) * 3.0
+            total_loss = weights[0] * loss_thm + weights[1] * loss_tof + weights[2] * loss_imu
 
         else:
-            # Default: simple balanced sum (dimensionality-aware)
-            w_thm = 1.0 / self.cfg.thm_out_dim
-            w_tof = 1.0 / self.cfg.tof_out_dim
-            total_loss = w_thm * loss_thm + w_tof * loss_tof
+            # Default: unweighted sum (optionally weight IMU)
+            total_loss = loss_thm + loss_tof + self.cfg.imu_weight * loss_imu
 
-        return total_loss, loss_thm.item(), loss_tof.item()
+        return total_loss, loss_thm.item(), loss_tof.item(), loss_imu.item()
 
     def _init_weights(self) -> None:
         for m in self.modules():

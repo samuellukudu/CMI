@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import random
-import gc
 from pathlib import Path
 from typing import Tuple, Dict
 
@@ -17,34 +15,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm, trange
-
-# -------------------------------------------------------------
-#  Reproducibility & memory helpers
-# -------------------------------------------------------------
-
-def seeding(seed: int) -> None:
-    """Global deterministic behaviour for reproducibility."""
-    np.random.seed(seed)
-    random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = False  # allows faster convs
-        torch.backends.cudnn.benchmark = True
-    print(f"Seeding done with seed={seed}")
-
-
-def flush() -> None:
-    """Release cached GPU memory to mitigate OOM between folds."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
+from utils import seeding, flush, seed_worker
 from masked_dataset import SensorMaskedDataset
 from masked_model import MaskedImputer, MaskedImputerConfig
 
@@ -79,9 +52,10 @@ def evaluate_reconstruction(model, val_loader, thm_scaler, tof_scaler, device):
             if hasattr(model, "cfg") and getattr(model.cfg, "use_mask_conditioning", False):
                 thm_in = batch["thm_input"].to(device)
                 tof_in = batch["tof_input"].to(device)
-                thm_pred, tof_pred = model(imu_batch, thm_in, tof_in)
+                imu_in = batch["imu_input"].to(device)
+                thm_pred, tof_pred, imu_pred = model(imu_batch, thm_in, tof_in, imu_in)
             else:
-                thm_pred, tof_pred = model(imu_batch)
+                thm_pred, tof_pred, imu_pred = model(imu_batch)
             
             # Store predictions and targets (scaled)
             all_thm_pred.append(thm_pred.cpu().numpy())
@@ -162,6 +136,7 @@ def train_fold(
     lr: float, 
     device: str,
     mask_ratio: float = 0.65,
+    imu_mask_ratio: float = 0.20,
     thm_observed: np.ndarray | None = None,
     tof_observed: np.ndarray | None = None,
 ) -> Dict[str, float]:
@@ -179,17 +154,30 @@ def train_fold(
     train_ds = SensorMaskedDataset(
         imu[train_idx], thm[train_idx], tof[train_idx],
         thm_observed=train_thm_obs, tof_observed=train_tof_obs,
-        mask_ratio=mask_ratio
+        mask_ratio=mask_ratio,
+        imu_mask_ratio=imu_mask_ratio
     )
     val_ds = SensorMaskedDataset(
         imu[val_idx], thm[val_idx], tof[val_idx],
         thm_observed=val_thm_obs, tof_observed=val_tof_obs,
-        mask_ratio=mask_ratio
+        mask_ratio=mask_ratio,
+        imu_mask_ratio=imu_mask_ratio
     )
     
     # Dataloaders
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        worker_init_fn=seed_worker,
+    )
 
     # Model
     model = MaskedImputer(cfg).to(device)
@@ -208,6 +196,7 @@ def train_fold(
         running_loss = 0.0
         running_thm_loss = 0.0
         running_tof_loss = 0.0
+        running_imu_loss = 0.0
         n_samples = 0
 
         for batch in tqdm(train_loader, desc="Train", leave=False):
@@ -215,23 +204,26 @@ def train_fold(
             imu_batch = batch["imu"].to(device)
             thm_target = batch["thm_target"].to(device)
             tof_target = batch["tof_target"].to(device)
+            imu_target = batch["imu_target"].to(device)
             thm_mask = batch["thm_mask"].to(device)
             tof_mask = batch["tof_mask"].to(device)
+            imu_mask = batch["imu_mask"].to(device)
             
             # Forward pass
             opt.zero_grad()
             if getattr(cfg, "use_mask_conditioning", False):
                 thm_in = batch["thm_input"].to(device)
                 tof_in = batch["tof_input"].to(device)
-                thm_pred, tof_pred = model(imu_batch, thm_in, tof_in)
+                imu_in = batch["imu_input"].to(device)
+                thm_pred, tof_pred, imu_pred = model(imu_batch, thm_in, tof_in, imu_in)
             else:
-                thm_pred, tof_pred = model(imu_batch)
+                thm_pred, tof_pred, imu_pred = model(imu_batch)
             
             # Calculate loss (only on masked positions)
-            loss, thm_loss_item, tof_loss_item = model.reconstruction_loss(
-                (thm_pred, tof_pred),
-                (thm_target, tof_target),
-                (thm_mask, tof_mask)
+            loss, thm_loss_item, tof_loss_item, imu_loss_item = model.reconstruction_loss(
+                (thm_pred, tof_pred, imu_pred),
+                (thm_target, tof_target, imu_target),
+                (thm_mask, tof_mask, imu_mask)
             )
             
             # Backward pass
@@ -246,17 +238,20 @@ def train_fold(
             # Track component losses (already computed in reconstruction_loss)
             running_thm_loss += thm_loss_item * batch_size
             running_tof_loss += tof_loss_item * batch_size
+            running_imu_loss += imu_loss_item * batch_size
 
         # Compute epoch metrics
         train_loss = running_loss / n_samples
         train_thm_loss = running_thm_loss / n_samples
         train_tof_loss = running_tof_loss / n_samples
+        train_imu_loss = running_imu_loss / n_samples
 
         # ---------- Validation ----------
         model.eval()
         val_running_loss = 0.0
         val_running_thm_loss = 0.0
         val_running_tof_loss = 0.0
+        val_running_imu_loss = 0.0
         val_n_samples = 0
 
         with torch.no_grad():
@@ -265,22 +260,25 @@ def train_fold(
                 imu_batch = batch["imu"].to(device)
                 thm_target = batch["thm_target"].to(device)
                 tof_target = batch["tof_target"].to(device)
+                imu_target = batch["imu_target"].to(device)
                 thm_mask = batch["thm_mask"].to(device)
                 tof_mask = batch["tof_mask"].to(device)
+                imu_mask = batch["imu_mask"].to(device)
                 
                 # Forward pass
                 if getattr(cfg, "use_mask_conditioning", False):
                     thm_in = batch["thm_input"].to(device)
                     tof_in = batch["tof_input"].to(device)
-                    thm_pred, tof_pred = model(imu_batch, thm_in, tof_in)
+                    imu_in = batch["imu_input"].to(device)
+                    thm_pred, tof_pred, imu_pred = model(imu_batch, thm_in, tof_in, imu_in)
                 else:
-                    thm_pred, tof_pred = model(imu_batch)
+                    thm_pred, tof_pred, imu_pred = model(imu_batch)
                 
                 # Calculate loss
-                loss, thm_loss_item, tof_loss_item = model.reconstruction_loss(
-                    (thm_pred, tof_pred),
-                    (thm_target, tof_target),
-                    (thm_mask, tof_mask)
+                loss, thm_loss_item, tof_loss_item, imu_loss_item = model.reconstruction_loss(
+                    (thm_pred, tof_pred, imu_pred),
+                    (thm_target, tof_target, imu_target),
+                    (thm_mask, tof_mask, imu_mask)
                 )
                 
                 # Track losses
@@ -291,11 +289,13 @@ def train_fold(
                 # Track component losses (already computed in reconstruction_loss)
                 val_running_thm_loss += thm_loss_item * batch_size
                 val_running_tof_loss += tof_loss_item * batch_size
+                val_running_imu_loss += imu_loss_item * batch_size
 
         # Compute validation metrics
         val_loss = val_running_loss / val_n_samples
         val_thm_loss = val_running_thm_loss / val_n_samples
         val_tof_loss = val_running_tof_loss / val_n_samples
+        val_imu_loss = val_running_imu_loss / val_n_samples
         
         # Update learning rate
         scheduler.step()
@@ -320,8 +320,8 @@ def train_fold(
         # Print metrics
         tqdm.write(
             f"Fold {fold} Epoch {epoch+1}/{epochs} - "
-            f"loss: {train_loss:.4f} (thm: {train_thm_loss:.4f}, tof: {train_tof_loss:.4f}) - "
-            f"val_loss: {val_loss:.4f} (thm: {val_thm_loss:.4f}, tof: {val_tof_loss:.4f})"
+            f"loss: {train_loss:.4f} (thm: {train_thm_loss:.4f}, tof: {train_tof_loss:.4f}, imu: {train_imu_loss:.4f}) - "
+            f"val_loss: {val_loss:.4f} (thm: {val_thm_loss:.4f}, tof: {val_tof_loss:.4f}, imu: {val_imu_loss:.4f})"
         )
 
     # Evaluate reconstruction quality on original scale
@@ -359,6 +359,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--mask_ratio", type=float, default=0.50, 
                         help="Mask ratio for sensor data (0.2-0.8)")
+    parser.add_argument("--imu_mask_ratio", type=float, default=0.20,
+                        help="Mask ratio applied to IMU values (0 disables masking)")
     parser.add_argument("--loss_type", choices=["mae", "mse", "huber", "conf_mse", "conf_mae", "conf_huber", "adaptive_weighted", "uncertainty_weighted", "gradient_cos", "balanced_mse"], default="balanced_mse",
                         help="Type of reconstruction loss to use (global/combiner). Base per-task loss can be overridden.")
     parser.add_argument("--thm_loss_type", choices=["mae", "mse", "huber"], default=None,
@@ -370,13 +372,17 @@ def main():
     parser.add_argument("--use_shared_decoder", action="store_true", help="Use shared MLP decoder trunk for THM and TOF")
     parser.add_argument("--shared_decoder_layers", type=int, default=2, help="Number of transformer decoder layers if using shared decoder")
     parser.add_argument("--shared_decoder_depth", type=int, default=3, help="Depth of shared MLP trunk layers")
+    parser.add_argument("--use_unet_decoder", action="store_true", help="Use UNet-style upsampling trunk with task heads")
     
     parser.add_argument("--use_mask_conditioning", action="store_true", help="Concatenate masked THM/TOF inputs with IMU for conditioning")
     args = parser.parse_args()
     
     # Validate mask_ratio
-    if not (0.15 <= args.mask_ratio <= 0.8):
-        raise ValueError(f"mask_ratio must be between 0.15 and 0.8, got {args.mask_ratio}")
+    if not (0.1 <= args.mask_ratio <= 0.8):
+        raise ValueError(f"mask_ratio must be between 0.1 and 0.8, got {args.mask_ratio}")
+    # Validate imu_mask_ratio
+    if not (0.0 <= args.imu_mask_ratio <= 0.8):
+        raise ValueError(f"imu_mask_ratio must be between 0.0 and 0.8, got {args.imu_mask_ratio}")
 
     # Set random seed
     seeding(args.seed)
@@ -390,6 +396,7 @@ def main():
         in_channels_imu=imu.shape[1],
         thm_out_dim=thm.shape[1],
         tof_out_dim=tof.shape[1],
+        imu_out_dim=imu.shape[1],
         loss_type=args.loss_type,
         thm_loss_type=args.thm_loss_type,
         tof_loss_type=args.tof_loss_type,
@@ -397,6 +404,7 @@ def main():
         use_shared_decoder=args.use_shared_decoder,
         shared_decoder_layers=args.shared_decoder_layers,
         shared_decoder_depth=args.shared_decoder_depth,
+        use_unet_decoder=args.use_unet_decoder,
         use_mask_conditioning=args.use_mask_conditioning,
     )
     print(f"Model configuration: {cfg}")
@@ -409,6 +417,7 @@ def main():
             fold, train_idx, val_idx, imu, thm, tof, cfg, 
             args.epochs, args.batch_size, args.lr, args.device,
             mask_ratio=args.mask_ratio,
+            imu_mask_ratio=args.imu_mask_ratio,
             thm_observed=thm_observed,
             tof_observed=tof_observed,
         )

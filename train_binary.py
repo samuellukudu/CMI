@@ -19,6 +19,7 @@ from tqdm.auto import tqdm, trange
 
 from imu_dataset import BinaryIMUDataset
 from imu_model import BinaryIMUCNN, BinaryIMUConfig
+from utils import seeding, flush, seed_worker
 
 ROOT = Path(__file__).parent
 PREP = ROOT / "preprocessed"
@@ -35,8 +36,8 @@ def load_artifacts() -> Tuple[np.ndarray, np.ndarray, list]:
 def train_fold(fold: int, train_idx: np.ndarray, val_idx: np.ndarray, imu: np.ndarray, y: np.ndarray, cfg: BinaryIMUConfig, epochs: int, batch_size: int, lr: float, device: str) -> float:
     # Dataset & loaders
     ds = BinaryIMUDataset(imu, y)
-    train_loader = DataLoader(Subset(ds, train_idx), batch_size=batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(Subset(ds, val_idx), batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(Subset(ds, train_idx), batch_size=batch_size, shuffle=True, drop_last=True, worker_init_fn=seed_worker)
+    val_loader = DataLoader(Subset(ds, val_idx), batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
     model = BinaryIMUCNN(cfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
@@ -88,14 +89,17 @@ def main():
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     imu, y, splits = load_artifacts()
+    seeding(args.seed)
     cfg = BinaryIMUConfig(in_channels=imu.shape[1])
 
     f1_scores = []
     for fold, (train_idx, val_idx) in enumerate(splits):
         f1 = train_fold(fold, train_idx, val_idx, imu, y, cfg, args.epochs, args.batch_size, args.lr, args.device)
+        flush()
         f1_scores.append(f1)
 
     print("\n=== Cross-validated Binary F1 ===")

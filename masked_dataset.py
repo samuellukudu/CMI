@@ -51,17 +51,19 @@ class SensorMaskedDataset(Dataset):
         tof_observed: Optional[np.ndarray] = None,
         mask_ratio: Union[float, Tuple[float, float]] = (0.5, 0.8),
         mask_value: float = 0.0,
+        # New: ratio applied to IMU masking (can be 0 to disable)
+        imu_mask_ratio: Union[float, Tuple[float, float]] = 0.0,
     ) -> None:
         assert len(imu_array) == len(thm_array) == len(tof_array), "Arrays length mismatch"
 
-        # Store as float32 to save memory + ensure torch compatibility
-        self.imu_array = imu_array.astype(np.float32)
-        self.thm_array = thm_array.astype(np.float32)
-        self.tof_array = tof_array.astype(np.float32)
+        # Ensure float32 without forcing copy if already in that dtype
+        self.imu_array = np.asarray(imu_array, dtype=np.float32)
+        self.thm_array = np.asarray(thm_array, dtype=np.float32)
+        self.tof_array = np.asarray(tof_array, dtype=np.float32)
         
-        # Store observed masks if provided
-        self.thm_observed = thm_observed.astype(np.float32) if thm_observed is not None else None
-        self.tof_observed = tof_observed.astype(np.float32) if tof_observed is not None else None
+        # Store observed masks if provided (keep boolean dtype)
+        self.thm_observed = thm_observed.astype(bool) if thm_observed is not None else None
+        self.tof_observed = tof_observed.astype(bool) if tof_observed is not None else None
         
         if self.thm_observed is not None:
             assert len(self.thm_observed) == len(thm_array), "THM observed mask length mismatch"
@@ -70,11 +72,13 @@ class SensorMaskedDataset(Dataset):
 
         if isinstance(mask_ratio, tuple):
             lo, hi = mask_ratio
-            assert 0.0 <= lo < hi <= 1.0, "mask_ratio tuple must be within [0,1] and lo < hi"
+            assert 0.1 <= lo < hi <= 0.8, "mask_ratio tuple must be within [0.1,0.8] and lo < hi"
         else:
-            assert 0.0 <= mask_ratio <= 1.0, "mask_ratio must be within [0,1]"
+            assert 0.1 <= mask_ratio <= 0.8, "mask_ratio must be within [0.1,0.8]"
         self.mask_ratio = mask_ratio
         self.mask_value = mask_value
+        # New
+        self.imu_mask_ratio = imu_mask_ratio
 
     # ---------------------------------------------------------------------
     #  Dataset protocol
@@ -95,15 +99,21 @@ class SensorMaskedDataset(Dataset):
             if isinstance(self.mask_ratio, tuple)
             else self.mask_ratio
         )
+        # New: IMU ratio (can be 0)
+        imu_ratio = (
+            np.random.uniform(*self.imu_mask_ratio)
+            if isinstance(self.imu_mask_ratio, tuple)
+            else self.imu_mask_ratio
+        )
 
         # -----------------------------------------------------------------
         #  Build loss masks (random on observed) and input masks (orig missing OR random)
         # -----------------------------------------------------------------
         # THM
         if self.thm_observed is not None:
-            thm_obs_mask = self.thm_observed[idx]  # 1 = observed, 0 = originally missing
-            thm_random_mask = (np.random.rand(*thm.shape) < ratio) & (thm_obs_mask == 1)
-            thm_input_mask = (thm_obs_mask == 0) | thm_random_mask
+            thm_obs_mask = self.thm_observed[idx]  # True = observed, False = originally missing
+            thm_random_mask = (np.random.rand(*thm.shape) < ratio) & thm_obs_mask
+            thm_input_mask = (~thm_obs_mask) | thm_random_mask
             thm_loss_mask = thm_random_mask
         else:
             thm_random_mask = np.random.rand(*thm.shape) < ratio
@@ -112,9 +122,9 @@ class SensorMaskedDataset(Dataset):
         
         # TOF
         if self.tof_observed is not None:
-            tof_obs_mask = self.tof_observed[idx]  # 1 = observed, 0 = originally missing
-            tof_random_mask = (np.random.rand(*tof.shape) < ratio) & (tof_obs_mask == 1)
-            tof_input_mask = (tof_obs_mask == 0) | tof_random_mask
+            tof_obs_mask = self.tof_observed[idx]  # True = observed, False = originally missing
+            tof_random_mask = (np.random.rand(*tof.shape) < ratio) & tof_obs_mask
+            tof_input_mask = (~tof_obs_mask) | tof_random_mask
             tof_loss_mask = tof_random_mask
         else:
             tof_random_mask = np.random.rand(*tof.shape) < ratio
@@ -126,9 +136,16 @@ class SensorMaskedDataset(Dataset):
         thm_in[thm_input_mask] = self.mask_value
         tof_in = tof.copy()
         tof_in[tof_input_mask] = self.mask_value
+        # IMU masking (random only)
+        imu_random_mask = np.random.rand(*imu.shape) < imu_ratio if imu_ratio > 0 else np.zeros_like(imu, dtype=bool)
+        imu_in = imu.copy()
+        imu_in[imu_random_mask] = self.mask_value
 
         return {
             "imu": torch.from_numpy(imu),
+            "imu_input": torch.from_numpy(imu_in),
+            "imu_target": torch.from_numpy(imu),
+            "imu_mask": torch.from_numpy(imu_random_mask.astype(np.float32)),
             "thm_input": torch.from_numpy(thm_in),
             "tof_input": torch.from_numpy(tof_in),
             "thm_target": torch.from_numpy(thm),
@@ -149,6 +166,7 @@ class SensorMaskedDataset(Dataset):
         mask_ratio: Union[float, Tuple[float, float]] = (0.5, 0.8),
         mask_value: float = 0.0,
         use_observed_masks: bool = True,
+        imu_mask_ratio: Union[float, Tuple[float, float]] = 0.0,
     ) -> "SensorMaskedDataset":
         """Instantiate the dataset directly from the *preprocessed* folder."""
         root = Path(root)
@@ -166,8 +184,8 @@ class SensorMaskedDataset(Dataset):
             except FileNotFoundError:
                 print("Warning: Observed masks not found, using pure random masking")
         
-        return cls(imu, thm, tof, thm_observed, tof_observed, 
-                  mask_ratio=mask_ratio, mask_value=mask_value)
+        return cls(imu, thm, tof, thm_observed, tof_observed,
+                   mask_ratio=mask_ratio, mask_value=mask_value, imu_mask_ratio=imu_mask_ratio)
 
 
 # ---------------------------------------------------------------------------

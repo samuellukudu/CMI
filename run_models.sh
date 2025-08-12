@@ -31,10 +31,10 @@ fi
 
 # Optional: expose device override (cpu|cuda|mps) by env var DEVICE
 DEVICE_ARG=${DEVICE:-}
+# Pre-declare array to prevent "unbound variable" errors under `set -u`
+declare -a DEVICE_FLAG=()
 if [[ -n "${DEVICE_ARG}" ]]; then
   DEVICE_FLAG=(--device "${DEVICE_ARG}")
-else
-  DEVICE_FLAG=()
 fi
 
 echo "[4/4] Running training scripts (comment out lines you don't need)"
@@ -42,16 +42,16 @@ echo "[4/4] Running training scripts (comment out lines you don't need)"
 # --- Stage 1: Masked sensor imputation ---
 # Uncomment/comment different strategies to experiment with different approaches
 
-# Strategy 1: Balanced MSE with per-task losses (recommended starting point)
-python train_masked.py \
-  --epochs 15 \
-  --batch_size 64 \
-  --mask_ratio 0.6 \
-  --loss_type balanced_mse \
-  --thm_loss_type mse \
-  --tof_loss_type huber \
-  --huber_beta 1.0 \
-  "${DEVICE_FLAG[@]}"
+# # Strategy 1: Balanced MSE with per-task losses (recommended starting point)
+# python train_masked.py \
+#   --epochs 5 \
+#   --batch_size 64 \
+#   --mask_ratio 0.2 \
+#   --loss_type conf_mse \
+#   # --thm_loss_type mse \
+#   # --tof_loss_type huber \
+#   --huber_beta 1.0 \
+#   ${DEVICE_FLAG[@]+"${DEVICE_FLAG[@]}"}
 
 # Strategy 2: With mask-aware conditioning (includes masked THM/TOF in encoder)
 # python train_masked.py \
@@ -63,19 +63,16 @@ python train_masked.py \
 #   --tof_loss_type huber \
 #   --huber_beta 1.0 \
 #   --use_mask_conditioning \
-#   "${DEVICE_FLAG[@]}"
+#   "${DEVICE_FLAG[@]:-}"
 
-# Strategy 3: Shared decoder trunk (encourages cross-modal representations)
-# python train_masked.py \
-#   --epochs 15 \
-#   --batch_size 64 \
-#   --mask_ratio 0.6 \
-#   --loss_type balanced_mse \
-#   --thm_loss_type mse \
-#   --tof_loss_type huber \
-#   --huber_beta 1.0 \
-#   --use_shared_decoder \
-#   "${DEVICE_FLAG[@]}"
+# Strategy 3: UNet-style upsampling trunk (shared feature maps)
+python train_masked.py \
+  --epochs 5 \
+  --batch_size 64 \
+  --mask_ratio 0.6 \
+  --loss_type mae \
+  --use_unet_decoder \
+  "${DEVICE_FLAG[@]+"${DEVICE_FLAG[@]}"}"
 
 # Strategy 4: Adaptive weighted (learnable task weights)
 # python train_masked.py \
