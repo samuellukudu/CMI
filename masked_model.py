@@ -210,7 +210,7 @@ class MaskedImputer(nn.Module):
         self._init_weights()
 
         # -------- uncertainty parameters for balanced loss --------
-        if "balanced" in self.cfg.loss_type or self.cfg.use_uncertainty_weighting:
+        if ("balanced" in (self.cfg.loss_type or "")) or self.cfg.use_uncertainty_weighting:
             # Learnable log variance/scale parameters for THM and TOF heads
             self.log_var_thm = nn.Parameter(torch.zeros(()))
             self.log_var_tof = nn.Parameter(torch.zeros(()))
@@ -224,8 +224,9 @@ class MaskedImputer(nn.Module):
             if thm_input is None or tof_input is None or imu_input is None:
                 raise ValueError("use_mask_conditioning=True but thm_input/tof_input/imu_input not provided")
             # Accept (B, C) or (B, C, L) for each; unify to (B, C, L)
-            if imu.dim() == 2:
-                imu = imu.unsqueeze(-1)
+            # Ensure inputs share shape (B, C, L) before concatenation
+            if imu_input.dim() == 2:
+                imu_input = imu_input.unsqueeze(-1)
             if thm_input.dim() == 2:
                 thm_input = thm_input.unsqueeze(-1)
             if tof_input.dim() == 2:
@@ -302,7 +303,7 @@ class MaskedImputer(nn.Module):
             return nn.MSELoss(reduction='none')
 
         # Determine base loss name (used if per-task override not provided)
-        base_name = self.cfg.loss_type.lower()
+        base_name = (self.cfg.loss_type or "mse").lower()
         if base_name not in {'mse', 'mae', 'huber'}:
             base_name = 'mse'
         thm_base = self.cfg.thm_loss_type.lower() if self.cfg.thm_loss_type else base_name
@@ -319,7 +320,7 @@ class MaskedImputer(nn.Module):
         loss_imu = masked_loss(imu_pred, imu_tgt, imu_mask, crit_imu)
 
         # Aggregation / balancing across tasks
-        if self.cfg.loss_type in {"balanced_mse", "uncertainty_weighted"}:
+        if (self.cfg.loss_type or "") in {"balanced_mse", "uncertainty_weighted"}:
             # Uncertainty-based weighting (Kendall et al.)
             if hasattr(self, 'log_var_thm') and hasattr(self, 'log_var_tof'):
                 precision_thm = torch.exp(-self.log_var_thm)

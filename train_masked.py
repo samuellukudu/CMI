@@ -124,21 +124,23 @@ def load_artifacts() -> Tuple[np.ndarray, np.ndarray, np.ndarray, list, np.ndarr
 
 
 def train_fold(
-    fold: int, 
-    train_idx: np.ndarray, 
-    val_idx: np.ndarray, 
-    imu: np.ndarray, 
+    fold: int,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    imu: np.ndarray,
     thm: np.ndarray,
     tof: np.ndarray,
-    cfg: MaskedImputerConfig, 
-    epochs: int, 
-    batch_size: int, 
-    lr: float, 
+    cfg: MaskedImputerConfig,
+    epochs: int,
+    batch_size: int,
+    lr: float,
     device: str,
     mask_ratio: float = 0.65,
     imu_mask_ratio: float = 0.20,
     thm_observed: np.ndarray | None = None,
     tof_observed: np.ndarray | None = None,
+    optimizer_type: str = "adam",
+    scheduler_type: str = "cosine",
 ) -> Dict[str, float]:
     """Train and evaluate a single fold."""
     # Load scalers for inverse transformation
@@ -181,11 +183,19 @@ def train_fold(
 
     # Model
     model = MaskedImputer(cfg).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
-    # Cosine annealing scheduler for smooth LR decay
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    opt, T_max=epochs
-    )
+    # Optimizer selection
+    if optimizer_type.lower() == "sgd":
+        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # Scheduler selection
+    if scheduler_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    elif scheduler_type == "onecycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, steps_per_epoch=len(train_loader), epochs=epochs)
+    else:
+        scheduler = None
     
     best_val_loss = float("inf")
     best_metrics = {}
@@ -229,6 +239,9 @@ def train_fold(
             # Backward pass
             loss.backward()
             opt.step()
+            # Batch-level scheduler update for OneCycleLR
+            if scheduler is not None and scheduler_type == "onecycle":
+                scheduler.step()
             
             # Track losses
             batch_size = imu_batch.size(0)
@@ -297,8 +310,9 @@ def train_fold(
         val_tof_loss = val_running_tof_loss / val_n_samples
         val_imu_loss = val_running_imu_loss / val_n_samples
         
-        # Update learning rate
-        scheduler.step()
+        # Update learning rate (epoch-level)
+        if scheduler is not None and scheduler_type != "onecycle":
+            scheduler.step()
         
         # Save best model
         if val_loss < best_val_loss:
@@ -361,12 +375,14 @@ def main():
                         help="Mask ratio for sensor data (0.2-0.8)")
     parser.add_argument("--imu_mask_ratio", type=float, default=0.20,
                         help="Mask ratio applied to IMU values (0 disables masking)")
-    parser.add_argument("--loss_type", choices=["mae", "mse", "huber", "conf_mse", "conf_mae", "conf_huber", "adaptive_weighted", "uncertainty_weighted", "gradient_cos", "balanced_mse"], default="balanced_mse",
+    parser.add_argument("--loss_type", choices=["mae", "mse", "huber", "conf_mse", "conf_mae", "conf_huber", "adaptive_weighted", "uncertainty_weighted", "gradient_cos", "balanced_mse"], default=None,
                         help="Type of reconstruction loss to use (global/combiner). Base per-task loss can be overridden.")
     parser.add_argument("--thm_loss_type", choices=["mae", "mse", "huber"], default=None,
                         help="Optional override for THM base loss type (per masked position).")
     parser.add_argument("--tof_loss_type", choices=["mae", "mse", "huber"], default=None,
                         help="Optional override for TOF base loss type (per masked position).")
+    parser.add_argument("--imu_loss_type", choices=["mae", "mse", "huber"], default=None,
+                        help="Optional override for IMU base loss type (per masked position).")
     parser.add_argument("--huber_beta", type=float, default=1.0,
                         help="Beta parameter for Huber loss")
     parser.add_argument("--use_shared_decoder", action="store_true", help="Use shared MLP decoder trunk for THM and TOF")
@@ -375,6 +391,9 @@ def main():
     parser.add_argument("--use_unet_decoder", action="store_true", help="Use UNet-style upsampling trunk with task heads")
     
     parser.add_argument("--use_mask_conditioning", action="store_true", help="Concatenate masked THM/TOF inputs with IMU for conditioning")
+    # Optimizer & scheduler options
+    parser.add_argument("--optimizer", choices=["adam", "sgd"], default="adam", help="Optimizer to use")
+    parser.add_argument("--scheduler", choices=["none", "cosine", "onecycle"], default="cosine", help="Learning rate scheduler")
     args = parser.parse_args()
     
     # Validate mask_ratio
@@ -400,6 +419,7 @@ def main():
         loss_type=args.loss_type,
         thm_loss_type=args.thm_loss_type,
         tof_loss_type=args.tof_loss_type,
+        imu_loss_type=args.imu_loss_type,
         huber_beta=args.huber_beta,
         use_shared_decoder=args.use_shared_decoder,
         shared_decoder_layers=args.shared_decoder_layers,
@@ -420,6 +440,8 @@ def main():
             imu_mask_ratio=args.imu_mask_ratio,
             thm_observed=thm_observed,
             tof_observed=tof_observed,
+            optimizer_type=args.optimizer,
+            scheduler_type=args.scheduler,
         )
         results.append(metrics)
         # Flush GPU memory between folds

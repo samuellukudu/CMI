@@ -33,14 +33,39 @@ def load_artifacts() -> Tuple[np.ndarray, np.ndarray, list]:
     return imu, y, splits
 
 
-def train_fold(fold: int, train_idx: np.ndarray, val_idx: np.ndarray, imu: np.ndarray, y: np.ndarray, cfg: BinaryIMUConfig, epochs: int, batch_size: int, lr: float, device: str) -> float:
+def train_fold(
+    fold: int,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    imu: np.ndarray,
+    y: np.ndarray,
+    cfg: BinaryIMUConfig,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    device: str,
+    optimizer_type: str = "adam",
+    scheduler_type: str = "cosine",
+) -> float:
     # Dataset & loaders
     ds = BinaryIMUDataset(imu, y)
     train_loader = DataLoader(Subset(ds, train_idx), batch_size=batch_size, shuffle=True, drop_last=True, worker_init_fn=seed_worker)
     val_loader = DataLoader(Subset(ds, val_idx), batch_size=batch_size, shuffle=False, worker_init_fn=seed_worker)
 
     model = BinaryIMUCNN(cfg).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    # Optimizer selection
+    if optimizer_type.lower() == "sgd":
+        opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # Scheduler selection
+    if scheduler_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    elif scheduler_type == "onecycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, steps_per_epoch=len(train_loader), epochs=epochs)
+    else:
+        scheduler = None
 
     for epoch in trange(epochs, desc=f"Fold {fold}"):
         model.train()
@@ -52,6 +77,9 @@ def train_fold(fold: int, train_idx: np.ndarray, val_idx: np.ndarray, imu: np.nd
             loss = model.loss(logits, yb)
             loss.backward()
             opt.step()
+            # OneCycleLR step per batch
+            if scheduler is not None and scheduler_type == "onecycle":
+                scheduler.step()
             running_loss += loss.item() * xb.size(0)
         avg_loss = running_loss / len(train_loader.dataset)
 
@@ -64,6 +92,10 @@ def train_fold(fold: int, train_idx: np.ndarray, val_idx: np.ndarray, imu: np.nd
                 logits = model(xb).squeeze(-1)
                 val_loss_total += model.loss(logits, yb).item() * xb.size(0)
         avg_val_loss = val_loss_total / len(val_loader.dataset)
+
+        # Epoch-level scheduler step
+        if scheduler is not None and scheduler_type != "onecycle":
+            scheduler.step()
 
         tqdm.write(f"Fold {fold} Epoch {epoch+1}/{epochs} - loss: {avg_loss:.4f} val_loss: {avg_val_loss:.4f}")
 
@@ -90,6 +122,9 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
+    # Optimizer & scheduler options
+    parser.add_argument("--optimizer", choices=["adam", "sgd"], default="adam", help="Optimizer to use")
+    parser.add_argument("--scheduler", choices=["none", "cosine", "onecycle"], default="cosine", help="Learning rate scheduler")
     args = parser.parse_args()
 
     imu, y, splits = load_artifacts()
@@ -98,7 +133,12 @@ def main():
 
     f1_scores = []
     for fold, (train_idx, val_idx) in enumerate(splits):
-        f1 = train_fold(fold, train_idx, val_idx, imu, y, cfg, args.epochs, args.batch_size, args.lr, args.device)
+        f1 = train_fold(
+            fold, train_idx, val_idx, imu, y, cfg,
+            args.epochs, args.batch_size, args.lr, args.device,
+            optimizer_type=args.optimizer,
+            scheduler_type=args.scheduler,
+        )
         flush()
         f1_scores.append(f1)
 

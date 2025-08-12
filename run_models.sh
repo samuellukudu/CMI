@@ -69,9 +69,13 @@ echo "[4/4] Running training scripts (comment out lines you don't need)"
 python train_masked.py \
   --epochs 5 \
   --batch_size 64 \
-  --mask_ratio 0.6 \
-  --loss_type mae \
+  --mask_ratio 0.3 \
+  --thm_loss_type mse \
+  --tof_loss_type huber \
+  --imu_loss_type mae \
+  --huber_beta 1.0 \
   --use_unet_decoder \
+  --use_mask_conditioning \
   "${DEVICE_FLAG[@]+"${DEVICE_FLAG[@]}"}"
 
 # Strategy 4: Adaptive weighted (learnable task weights)
