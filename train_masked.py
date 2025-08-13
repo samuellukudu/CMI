@@ -38,12 +38,18 @@ def mean_absolute_percentage_error(y_true, y_pred):
 # Evaluate on original scale by inverse-transforming predictions and targets
 # using saved RobustScaler objects. No need to load unscaled arrays from disk.
 def evaluate_reconstruction(model, val_loader, thm_scaler, tof_scaler, device):
-    """Evaluate reconstruction quality on original scale using R2, MSE, MAE, MAPE."""
+    """Evaluate reconstruction quality on original scale using R2, MSE, MAE, MAPE.
+
+    Metrics are computed ONLY on positions that were masked for loss (reconstructed positions),
+    not on already-observed inputs.
+    """
     model.eval()
     all_thm_pred = []
     all_tof_pred = []
     all_thm_true = []
     all_tof_true = []
+    all_thm_mask = []
+    all_tof_mask = []
     
     with torch.no_grad():
         for batch in val_loader:
@@ -62,6 +68,8 @@ def evaluate_reconstruction(model, val_loader, thm_scaler, tof_scaler, device):
             all_tof_pred.append(tof_pred.cpu().numpy())
             all_thm_true.append(batch["thm_target"].numpy())
             all_tof_true.append(batch["tof_target"].numpy())
+            all_thm_mask.append(batch["thm_mask"].numpy())
+            all_tof_mask.append(batch["tof_mask"].numpy())
     
     # Concatenate all batches
     thm_pred_scaled = np.concatenate(all_thm_pred, axis=0)
@@ -74,18 +82,25 @@ def evaluate_reconstruction(model, val_loader, thm_scaler, tof_scaler, device):
     tof_pred_orig = tof_scaler.inverse_transform(tof_pred_scaled)
     thm_true_orig = thm_scaler.inverse_transform(thm_true_scaled)
     tof_true_orig = tof_scaler.inverse_transform(tof_true_scaled)
+    # Concatenate masks
+    thm_mask = np.concatenate(all_thm_mask, axis=0).astype(bool)
+    tof_mask = np.concatenate(all_tof_mask, axis=0).astype(bool)
     
-    # Calculate metrics for THM
-    thm_r2 = r2_score(thm_true_orig.flatten(), thm_pred_orig.flatten())
-    thm_mse = mean_squared_error(thm_true_orig.flatten(), thm_pred_orig.flatten())
-    thm_mae = mean_absolute_error(thm_true_orig.flatten(), thm_pred_orig.flatten())
-    thm_mape = mean_absolute_percentage_error(thm_true_orig.flatten(), thm_pred_orig.flatten())
+    # Calculate metrics for THM on masked positions only
+    thm_true_masked = thm_true_orig[thm_mask]
+    thm_pred_masked = thm_pred_orig[thm_mask]
+    thm_r2 = r2_score(thm_true_masked, thm_pred_masked)
+    thm_mse = mean_squared_error(thm_true_masked, thm_pred_masked)
+    thm_mae = mean_absolute_error(thm_true_masked, thm_pred_masked)
+    thm_mape = mean_absolute_percentage_error(thm_true_masked, thm_pred_masked)
     
-    # Calculate metrics for TOF
-    tof_r2 = r2_score(tof_true_orig.flatten(), tof_pred_orig.flatten())
-    tof_mse = mean_squared_error(tof_true_orig.flatten(), tof_pred_orig.flatten())
-    tof_mae = mean_absolute_error(tof_true_orig.flatten(), tof_pred_orig.flatten())
-    tof_mape = mean_absolute_percentage_error(tof_true_orig.flatten(), tof_pred_orig.flatten())
+    # Calculate metrics for TOF on masked positions only
+    tof_true_masked = tof_true_orig[tof_mask]
+    tof_pred_masked = tof_pred_orig[tof_mask]
+    tof_r2 = r2_score(tof_true_masked, tof_pred_masked)
+    tof_mse = mean_squared_error(tof_true_masked, tof_pred_masked)
+    tof_mae = mean_absolute_error(tof_true_masked, tof_pred_masked)
+    tof_mape = mean_absolute_percentage_error(tof_true_masked, tof_pred_masked)
     
     return {
         "thm_r2": thm_r2,
@@ -157,13 +172,16 @@ def train_fold(
         imu[train_idx], thm[train_idx], tof[train_idx],
         thm_observed=train_thm_obs, tof_observed=train_tof_obs,
         mask_ratio=mask_ratio,
-        imu_mask_ratio=imu_mask_ratio
+        imu_mask_ratio=imu_mask_ratio,
+        freeze_masks=False,
     )
     val_ds = SensorMaskedDataset(
         imu[val_idx], thm[val_idx], tof[val_idx],
         thm_observed=val_thm_obs, tof_observed=val_tof_obs,
         mask_ratio=mask_ratio,
-        imu_mask_ratio=imu_mask_ratio
+        imu_mask_ratio=imu_mask_ratio,
+        freeze_masks=True,
+        mask_seed=42,
     )
     
     # Dataloaders
@@ -337,6 +355,8 @@ def train_fold(
             f"loss: {train_loss:.4f} (thm: {train_thm_loss:.4f}, tof: {train_tof_loss:.4f}, imu: {train_imu_loss:.4f}) - "
             f"val_loss: {val_loss:.4f} (thm: {val_thm_loss:.4f}, tof: {val_tof_loss:.4f}, imu: {val_imu_loss:.4f})"
         )
+        # Release memory after each epoch
+        flush()
 
     # Evaluate reconstruction quality on original scale
     print(f"\nEvaluating reconstruction quality for fold {fold}...")
@@ -385,12 +405,12 @@ def main():
                         help="Optional override for IMU base loss type (per masked position).")
     parser.add_argument("--huber_beta", type=float, default=1.0,
                         help="Beta parameter for Huber loss")
-    parser.add_argument("--use_shared_decoder", action="store_true", help="Use shared MLP decoder trunk for THM and TOF")
-    parser.add_argument("--shared_decoder_layers", type=int, default=2, help="Number of transformer decoder layers if using shared decoder")
-    parser.add_argument("--shared_decoder_depth", type=int, default=3, help="Depth of shared MLP trunk layers")
+    # Shared decoder options removed (using UNet-like or per-head MLP)
     parser.add_argument("--use_unet_decoder", action="store_true", help="Use UNet-style upsampling trunk with task heads")
     
     parser.add_argument("--use_mask_conditioning", action="store_true", help="Concatenate masked THM/TOF inputs with IMU for conditioning")
+    parser.add_argument("--use_task_attention", action="store_true", help="Enable cross-task attention between THM and TOF")
+    parser.add_argument("--data_dir", type=str, default=None, help="Directory containing preprocessed artifacts")
     # Optimizer & scheduler options
     parser.add_argument("--optimizer", choices=["adam", "sgd"], default="adam", help="Optimizer to use")
     parser.add_argument("--scheduler", choices=["none", "cosine", "onecycle"], default="cosine", help="Learning rate scheduler")
@@ -405,6 +425,11 @@ def main():
 
     # Set random seed
     seeding(args.seed)
+
+    # Override preprocessed data directory if provided
+    global PREP
+    if args.data_dir is not None:
+        PREP = Path(args.data_dir)
 
     # Load data
     print("Loading preprocessed data...")
@@ -421,11 +446,10 @@ def main():
         tof_loss_type=args.tof_loss_type,
         imu_loss_type=args.imu_loss_type,
         huber_beta=args.huber_beta,
-        use_shared_decoder=args.use_shared_decoder,
-        shared_decoder_layers=args.shared_decoder_layers,
-        shared_decoder_depth=args.shared_decoder_depth,
+        # shared decoder args removed
         use_unet_decoder=args.use_unet_decoder,
         use_mask_conditioning=args.use_mask_conditioning,
+        use_task_attention=args.use_task_attention,
     )
     print(f"Model configuration: {cfg}")
 

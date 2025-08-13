@@ -56,9 +56,6 @@ class MaskedImputerConfig:
     tof_hidden_dims: Sequence[int] = field(default_factory=lambda: [512, 256, 128])
 
     # Multi-task learning configuration
-    use_shared_decoder: bool = False  # Whether to use shared decoder layers
-    shared_decoder_layers: int = 2  # Number of shared decoder layers before branching
-    shared_decoder_depth: int = 3  # Depth of shared MLP trunk layers
     use_task_attention: bool = True  # Cross-attention between THM and TOF tasks
     # UNet-style decoder (shared up-sampling trunk + heads)
     use_unet_decoder: bool = False
@@ -69,16 +66,6 @@ class MaskedImputerConfig:
     tof_loss_type: str | None = None  # Optional override for TOF loss (defaults to loss_type)
     huber_beta: float = 1.0  # delta parameter for Huber/SmoothL1 loss
     use_uncertainty_weighting: bool = True  # Learn uncertainty-based task weights
-    use_homoscedastic_uncertainty: bool = True  # Model output uncertainty
-    loss_temperature: float = 1.0  # Temperature for loss balancing
-    
-    # Better adaptive loss weighting
-    adaptive_loss_alpha: float = 0.1  # Reduced learning rate for stability
-    gradient_normalization: bool = True  # Enable gradient normalization
-    
-    # Cross-modal alignment
-    use_cross_modal_loss: bool = False  # Disable for now - adds complexity
-    cross_modal_weight: float = 0.1  # Weight for cross-modal loss
 
     # Regularisation
     dropout: float = 0.1  # Reduced dropout
@@ -140,41 +127,17 @@ class MaskedImputer(nn.Module):
             self.head_thm = nn.Conv1d(trunk_c, self.cfg.thm_out_dim, kernel_size=1)
             self.head_tof = nn.Conv1d(trunk_c, self.cfg.tof_out_dim, kernel_size=1)
             self.head_imu = nn.Conv1d(trunk_c, self.cfg.imu_out_dim, kernel_size=1)
-        elif self.cfg.use_shared_decoder:
-            # Lightweight shared MLP trunk with task-specific heads
-            shared_hidden = self.cfg.latent_dim // 2
-
-            # Shared trunk
-            self.shared_trunk = nn.Sequential(
-                nn.Linear(self.cfg.latent_dim, shared_hidden),
-                nn.ReLU(inplace=True),
-                nn.Dropout(self.cfg.dropout),
-                nn.Linear(shared_hidden, shared_hidden),
-                nn.ReLU(inplace=True),
-                nn.Dropout(self.cfg.dropout),
-            )
-            
-            # Task-specific heads
-            self.decoder_thm = nn.Sequential(
-                nn.Linear(shared_hidden, shared_hidden // 2),
-                nn.ReLU(inplace=True),
-                nn.Dropout(self.cfg.dropout),
-                nn.Linear(shared_hidden // 2, self.cfg.thm_out_dim),
-            )
-            
-            self.decoder_tof = nn.Sequential(
-                nn.Linear(shared_hidden, shared_hidden),
-                nn.ReLU(inplace=True),
-                nn.Dropout(self.cfg.dropout),
-                nn.Linear(shared_hidden, self.cfg.tof_out_dim),
-            )
-            # IMU decoder head
-            self.decoder_imu = nn.Sequential(
-                nn.Linear(shared_hidden, shared_hidden // 2),
-                nn.ReLU(inplace=True),
-                nn.Dropout(self.cfg.dropout),
-                nn.Linear(shared_hidden // 2, self.cfg.imu_out_dim),
-            )
+            # Optional cross-attention between THM and TOF sequences
+            if getattr(self.cfg, 'use_task_attention', False):
+                self.unet_attn = nn.MultiheadAttention(
+                    embed_dim=trunk_c,
+                    num_heads=4,
+                    dropout=self.cfg.dropout,
+                    batch_first=True,
+                )
+                # Lightweight projections per task to form queries/keys/values
+                self.thm_proj = nn.Conv1d(trunk_c, trunk_c, kernel_size=1)
+                self.tof_proj = nn.Conv1d(trunk_c, trunk_c, kernel_size=1)
         else:
             # THM decoder - simple and effective
             self.decoder_thm = nn.Sequential(
@@ -240,21 +203,25 @@ class MaskedImputer(nn.Module):
         # ---- UNet branch ----
         if getattr(self.cfg, 'use_unet_decoder', False):
             feat = self.upsample_trunk(enc_feat)  # (B, trunk_c, L)
-            thm_pred = self.head_thm(feat).mean(dim=-1)  # (B, thm_out)
-            tof_pred = self.head_tof(feat).mean(dim=-1)  # (B, tof_out)
-            imu_pred = self.head_imu(feat).mean(dim=-1)  # (B, imu_out)
+            if getattr(self.cfg, 'use_task_attention', False):
+                # Form per-task sequences (B, L, C)
+                thm_seq = self.thm_proj(feat).transpose(1, 2)
+                tof_seq = self.tof_proj(feat).transpose(1, 2)
+                # THM attends to TOF; TOF attends to THM
+                thm_ctx, _ = self.unet_attn(thm_seq, tof_seq, tof_seq)
+                tof_ctx, _ = self.unet_attn(tof_seq, thm_seq, thm_seq)
+                thm_feat = thm_ctx.transpose(1, 2)  # (B, C, L)
+                tof_feat = tof_ctx.transpose(1, 2)   # (B, C, L)
+            else:
+                thm_feat = tof_feat = feat
+            thm_pred = self.head_thm(thm_feat).mean(dim=-1)  # (B, thm_out)
+            tof_pred = self.head_tof(tof_feat).mean(dim=-1)  # (B, tof_out)
+            imu_pred = self.head_imu(feat).mean(dim=-1)      # (B, imu_out)
             return thm_pred, tof_pred, imu_pred
         # ---- MLP branches ----
         z = self.global_pool(enc_feat).squeeze(-1)  # (B, C*)
         z = self.to_latent(z)  # (B, latent)
-        
-        if self.cfg.use_shared_decoder:
-            shared_feat = self.shared_trunk(z)
-            thm_pred = self.decoder_thm(shared_feat)
-            tof_pred = self.decoder_tof(shared_feat)
-            imu_pred = self.decoder_imu(shared_feat)
-            return thm_pred, tof_pred, imu_pred
-        
+
         # Individual decoders
         thm_pred = self.decoder_thm(z)
         tof_pred = self.decoder_tof(z)
@@ -321,17 +288,21 @@ class MaskedImputer(nn.Module):
 
         # Aggregation / balancing across tasks
         if (self.cfg.loss_type or "") in {"balanced_mse", "uncertainty_weighted"}:
-            # Uncertainty-based weighting (Kendall et al.)
-            if hasattr(self, 'log_var_thm') and hasattr(self, 'log_var_tof'):
-                precision_thm = torch.exp(-self.log_var_thm)
-                precision_tof = torch.exp(-self.log_var_tof)
-                total_loss = (
-                    precision_thm * loss_thm + self.log_var_thm +
-                    precision_tof * loss_tof + self.log_var_tof
-                )
-            else:
-                # Unweighted sum – inputs are already min-max scaled
-                total_loss = loss_thm + loss_tof + self.cfg.imu_weight * loss_imu
+            # Uncertainty-based weighting (Kendall et al.) extended to IMU
+            if not hasattr(self, 'log_var_thm'):
+                self.log_var_thm = nn.Parameter(torch.zeros(()))
+            if not hasattr(self, 'log_var_tof'):
+                self.log_var_tof = nn.Parameter(torch.zeros(()))
+            if not hasattr(self, 'log_var_imu'):
+                self.log_var_imu = nn.Parameter(torch.zeros(()))
+            precision_thm = torch.exp(-self.log_var_thm)
+            precision_tof = torch.exp(-self.log_var_tof)
+            precision_imu = torch.exp(-self.log_var_imu)
+            total_loss = (
+                precision_thm * loss_thm + self.log_var_thm +
+                precision_tof * loss_tof + self.log_var_tof +
+                precision_imu * loss_imu + self.log_var_imu
+            )
 
         elif self.cfg.loss_type == "adaptive_weighted":
             # Learnable weights via softmax

@@ -5,6 +5,7 @@ polars
 pandas
 scikit-learn
 scipy
+PyWavelets
 matplotlib
 tqdm
 timm

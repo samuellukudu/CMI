@@ -3,12 +3,13 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import StratifiedGroupKFold
 from typing import Tuple, List
+import argparse
 import os
 import joblib
 
 from scipy.spatial.transform import Rotation as R
 
-# Paths
+# Paths (defaults; can be overridden via CLI)
 TRAIN_PATH = "input/train.csv"
 TEST_PATH = "input/test.csv"
 PREPROCESSED_DIR = "preprocessed"
@@ -246,53 +247,19 @@ def scale_features(train: pl.DataFrame, test: pl.DataFrame, feature_cols: List[s
     test_scaled = np.nan_to_num(test_scaled)
     return train_scaled, test_scaled, scaler
 
-# 5. Robust Stratified Group K-Fold for both Binary and Multi-Class
-def get_binary_bfrb_target(sequence_type: str) -> int:
-    """Convert sequence_type to binary target (BFRB vs non-BFRB)"""
-    return 1 if sequence_type == "Target" else 0
-
-def get_stratified_group_kfold_splits(
-    df: pl.DataFrame, 
-    n_splits: int = 5, 
-    group_col: str = "subject", 
+# 5. Stratified Group K-Fold for full 18-class gesture task
+def get_full_gesture_splits(
+    df: pl.DataFrame,
+    n_splits: int = 5,
+    group_col: str = "subject",
     target_col: str = "gesture",
-    task: str = "binary"  # 'binary' for BFRB vs non-BFRB, 'multiclass' for BFRB gestures only
 ) -> Tuple[list, np.ndarray]:
-    """
-    Get stratified group k-fold splits for either binary or multiclass BFRB classification.
-    
-    Args:
-        df: Input dataframe
-        n_splits: Number of folds
-        group_col: Column name for grouping (usually subject)
-        target_col: Column containing gesture labels
-        task: Either 'binary' or 'multiclass'
-        
-    Returns:
-        splits: List of (train_idx, val_idx) tuples
-        y: Target values used for stratification
-    """
+    """Stratified group K-fold over all gestures (targets and non-targets)."""
     groups = df[group_col].to_numpy()
-    sequence_types = df['sequence_type'].to_numpy()
-    gestures = df[target_col].to_numpy()
-
-    if task == "binary":
-        # Use sequence_type for binary target
-        y = np.array([get_binary_bfrb_target(st) for st in sequence_types])
-        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        splits = list(sgkf.split(df, y, groups))
-        return splits, y
-    else:  # multiclass
-        # Only use rows with sequence_type == "Target" (BFRB)
-        bfrb_mask = sequence_types == "Target"
-        if not any(bfrb_mask):
-            return [], np.array([])
-        df_bfrb = df.filter(pl.Series(bfrb_mask))
-        groups = df_bfrb[group_col].to_numpy()
-        y = df_bfrb[target_col].to_numpy()
-        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        splits = list(sgkf.split(df_bfrb, y, groups))
-        return splits, y
+    y = df[target_col].to_numpy()
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    splits = list(sgkf.split(df, y, groups))
+    return splits, y
 
 # Save preprocessing outputs
 def save_preprocessing_outputs(data: dict, out_dir: str = PREPROCESSED_DIR):
@@ -316,12 +283,10 @@ def save_preprocessing_outputs(data: dict, out_dir: str = PREPROCESSED_DIR):
     joblib.dump(data['imu_scaler'], os.path.join(out_dir, 'imu_scaler.joblib'))
     joblib.dump(data['thm_scaler'], os.path.join(out_dir, 'thm_scaler.joblib'))
     joblib.dump(data['tof_scaler'], os.path.join(out_dir, 'tof_scaler.joblib'))
-    # Save both binary and BFRB-specific CV splits
+    # Save unified CV splits and labels for 18-class gesture task
     joblib.dump({
-        'binary_splits': data['binary_cv_splits'],
-        'binary_targets': data['binary_targets'],
-        'bfrb_splits': data['bfrb_cv_splits'],
-        'bfrb_targets': data['bfrb_targets']
+        'all_splits': data['all_splits'],
+        'all_gestures': data['all_gestures'],
     }, os.path.join(out_dir, 'cv_splits.joblib'))
     # Save feature column names
     joblib.dump(data['imu_cols'], os.path.join(out_dir, 'imu_cols.joblib'))
@@ -329,8 +294,16 @@ def save_preprocessing_outputs(data: dict, out_dir: str = PREPROCESSED_DIR):
     joblib.dump(data['tof_cols'], os.path.join(out_dir, 'tof_cols.joblib'))
 
 # Main preprocessing function
-def preprocess():
-    train, test = load_data(TRAIN_PATH, TEST_PATH)
+def preprocess(
+    train_path: str = TRAIN_PATH,
+    test_path: str = TEST_PATH,
+    out_dir: str = PREPROCESSED_DIR,
+    n_splits: int = 5,
+    group_col: str = "subject",
+    target_col: str = "gesture",
+):
+    """Run preprocessing pipeline and save outputs to out_dir."""
+    train, test = load_data(train_path, test_path)
 
     # Downcast dtypes for memory efficiency
     train = downcast_dtypes(train)
@@ -386,12 +359,9 @@ def preprocess():
     train_thm, test_thm, thm_scaler = scale_features(train, test, thm_cols)
     train_tof, test_tof, tof_scaler = scale_features(train, test, tof_cols)
 
-    # Robust cross-validation splits for both tasks
-    binary_cv_splits, binary_targets = get_stratified_group_kfold_splits(
-        train, n_splits=5, group_col="subject", target_col="gesture", task="binary"
-    )
-    bfrb_cv_splits, bfrb_targets = get_stratified_group_kfold_splits(
-        train, n_splits=5, group_col="subject", target_col="gesture", task="multiclass"
+    # Unified CV splits for the 18-class gesture task
+    all_splits, all_gestures = get_full_gesture_splits(
+        train, n_splits=n_splits, group_col=group_col, target_col=target_col
     )
 
     # BFRB-only DataFrame for multi-class gesture modeling
@@ -409,7 +379,7 @@ def preprocess():
             print(f"No NaNs found in {name} data.")
 
     # Return processed data and splits for further use
-    return {
+    data = {
         "train": train,
         "test": test,
         "train_imu": train_imu,
@@ -422,10 +392,8 @@ def preprocess():
         "train_tof_observed": train_tof_observed,
         "test_thm_observed": test_thm_observed,
         "test_tof_observed": test_tof_observed,
-        "binary_cv_splits": binary_cv_splits,
-        "binary_targets": binary_targets,
-        "bfrb_cv_splits": bfrb_cv_splits,
-        "bfrb_targets": bfrb_targets,
+        "all_splits": all_splits,
+        "all_gestures": all_gestures,
         "bfrb_train": bfrb_train,
         "imu_cols": imu_cols,
         "thm_cols": thm_cols,
@@ -434,8 +402,30 @@ def preprocess():
         "thm_scaler": thm_scaler,
         "tof_scaler": tof_scaler,
     }
+    save_preprocessing_outputs(data, out_dir)
+    return data
+
+def main():
+    parser = argparse.ArgumentParser(description="Preprocess CMI dataset")
+    parser.add_argument("--train_path", type=str, default=TRAIN_PATH, help="Path to train CSV")
+    parser.add_argument("--test_path", type=str, default=TEST_PATH, help="Path to test CSV")
+    parser.add_argument("--out_dir", type=str, default=PREPROCESSED_DIR, help="Output directory")
+    parser.add_argument("--n_splits", type=int, default=5, help="Number of CV splits")
+    parser.add_argument("--group_col", type=str, default="subject", help="Group column for CV")
+    parser.add_argument("--target_col", type=str, default="gesture", help="Target column for CV")
+    args = parser.parse_args()
+
+    data = preprocess(
+        train_path=args.train_path,
+        test_path=args.test_path,
+        out_dir=args.out_dir,
+        n_splits=args.n_splits,
+        group_col=args.group_col,
+        target_col=args.target_col,
+    )
+    print("Preprocessing complete. Data saved to:", args.out_dir)
+    print("Data dictionary keys:", list(data.keys()))
+
 
 if __name__ == "__main__":
-    data = preprocess()
-    save_preprocessing_outputs(data)
-    print("Preprocessing complete. Data dictionary keys:", list(data.keys()))
+    main()

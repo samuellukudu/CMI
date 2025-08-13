@@ -53,6 +53,9 @@ class SensorMaskedDataset(Dataset):
         mask_value: float = 0.0,
         # New: ratio applied to IMU masking (can be 0 to disable)
         imu_mask_ratio: Union[float, Tuple[float, float]] = 0.0,
+        # Freeze and reuse masks (e.g., for validation)
+        freeze_masks: bool = False,
+        mask_seed: Optional[int] = None,
     ) -> None:
         assert len(imu_array) == len(thm_array) == len(tof_array), "Arrays length mismatch"
 
@@ -79,6 +82,41 @@ class SensorMaskedDataset(Dataset):
         self.mask_value = mask_value
         # New
         self.imu_mask_ratio = imu_mask_ratio
+        self.freeze_masks = freeze_masks
+        self.mask_seed = mask_seed
+
+        # Optionally precompute and freeze random masks (useful for validation)
+        if self.freeze_masks:
+            rng = np.random.RandomState(self.mask_seed)
+            N = len(self.imu_array)
+            thm_dim = self.thm_array.shape[1]
+            tof_dim = self.tof_array.shape[1]
+            imu_dim = self.imu_array.shape[1]
+
+            # Sample per-instance ratios if a range is provided
+            if isinstance(self.mask_ratio, tuple):
+                lo, hi = self.mask_ratio
+                th_ratio = rng.uniform(lo, hi, size=N)
+            else:
+                th_ratio = np.full(N, float(self.mask_ratio), dtype=np.float32)
+            if isinstance(self.imu_mask_ratio, tuple):
+                loi, hii = self.imu_mask_ratio
+                im_ratio = rng.uniform(loi, hii, size=N)
+            else:
+                im_ratio = np.full(N, float(self.imu_mask_ratio), dtype=np.float32)
+
+            # Random draws
+            thm_rand = rng.rand(N, thm_dim) < th_ratio[:, None]
+            tof_rand = rng.rand(N, tof_dim) < th_ratio[:, None]
+            imu_rand = rng.rand(N, imu_dim) < im_ratio[:, None]
+            if self.thm_observed is not None:
+                thm_rand = thm_rand & self.thm_observed
+            if self.tof_observed is not None:
+                tof_rand = tof_rand & self.tof_observed
+
+            self._frozen_thm_loss_mask = thm_rand
+            self._frozen_tof_loss_mask = tof_rand
+            self._frozen_imu_mask = imu_rand
 
     # ---------------------------------------------------------------------
     #  Dataset protocol
@@ -109,27 +147,42 @@ class SensorMaskedDataset(Dataset):
         # -----------------------------------------------------------------
         #  Build loss masks (random on observed) and input masks (orig missing OR random)
         # -----------------------------------------------------------------
-        # THM
-        if self.thm_observed is not None:
-            thm_obs_mask = self.thm_observed[idx]  # True = observed, False = originally missing
-            thm_random_mask = (np.random.rand(*thm.shape) < ratio) & thm_obs_mask
-            thm_input_mask = (~thm_obs_mask) | thm_random_mask
-            thm_loss_mask = thm_random_mask
+        if self.freeze_masks:
+            thm_loss_mask = self._frozen_thm_loss_mask[idx]
+            tof_loss_mask = self._frozen_tof_loss_mask[idx]
+            imu_random_mask = self._frozen_imu_mask[idx]
+            if self.thm_observed is not None:
+                thm_obs_mask = self.thm_observed[idx]
+                thm_input_mask = (~thm_obs_mask) | thm_loss_mask
+            else:
+                thm_input_mask = thm_loss_mask
+            if self.tof_observed is not None:
+                tof_obs_mask = self.tof_observed[idx]
+                tof_input_mask = (~tof_obs_mask) | tof_loss_mask
+            else:
+                tof_input_mask = tof_loss_mask
         else:
-            thm_random_mask = np.random.rand(*thm.shape) < ratio
-            thm_input_mask = thm_random_mask
-            thm_loss_mask = thm_random_mask
-        
-        # TOF
-        if self.tof_observed is not None:
-            tof_obs_mask = self.tof_observed[idx]  # True = observed, False = originally missing
-            tof_random_mask = (np.random.rand(*tof.shape) < ratio) & tof_obs_mask
-            tof_input_mask = (~tof_obs_mask) | tof_random_mask
-            tof_loss_mask = tof_random_mask
-        else:
-            tof_random_mask = np.random.rand(*tof.shape) < ratio
-            tof_input_mask = tof_random_mask
-            tof_loss_mask = tof_random_mask
+            # THM
+            if self.thm_observed is not None:
+                thm_obs_mask = self.thm_observed[idx]  # True = observed, False = originally missing
+                thm_random_mask = (np.random.rand(*thm.shape) < ratio) & thm_obs_mask
+                thm_input_mask = (~thm_obs_mask) | thm_random_mask
+                thm_loss_mask = thm_random_mask
+            else:
+                thm_random_mask = np.random.rand(*thm.shape) < ratio
+                thm_input_mask = thm_random_mask
+                thm_loss_mask = thm_random_mask
+            
+            # TOF
+            if self.tof_observed is not None:
+                tof_obs_mask = self.tof_observed[idx]  # True = observed, False = originally missing
+                tof_random_mask = (np.random.rand(*tof.shape) < ratio) & tof_obs_mask
+                tof_input_mask = (~tof_obs_mask) | tof_random_mask
+                tof_loss_mask = tof_random_mask
+            else:
+                tof_random_mask = np.random.rand(*tof.shape) < ratio
+                tof_input_mask = tof_random_mask
+                tof_loss_mask = tof_random_mask
 
         # Create masked copies for model input (mask both originally missing and random)
         thm_in = thm.copy()
@@ -137,7 +190,11 @@ class SensorMaskedDataset(Dataset):
         tof_in = tof.copy()
         tof_in[tof_input_mask] = self.mask_value
         # IMU masking (random only)
-        imu_random_mask = np.random.rand(*imu.shape) < imu_ratio if imu_ratio > 0 else np.zeros_like(imu, dtype=bool)
+        if self.freeze_masks:
+            # imu_random_mask already set
+            pass
+        else:
+            imu_random_mask = np.random.rand(*imu.shape) < imu_ratio if imu_ratio > 0 else np.zeros_like(imu, dtype=bool)
         imu_in = imu.copy()
         imu_in[imu_random_mask] = self.mask_value
 
@@ -153,6 +210,10 @@ class SensorMaskedDataset(Dataset):
             # Loss masks: 1 at randomly masked observed positions only
             "thm_mask": torch.from_numpy(thm_loss_mask.astype(np.float32)),
             "tof_mask": torch.from_numpy(tof_loss_mask.astype(np.float32)),
+            # Input masks (include originally missing for THM/TOF, random for IMU)
+            "thm_input_mask": torch.from_numpy(thm_input_mask.astype(np.float32)),
+            "tof_input_mask": torch.from_numpy(tof_input_mask.astype(np.float32)),
+            "imu_input_mask": torch.from_numpy(imu_random_mask.astype(np.float32)),
         }
 
     # ---------------------------------------------------------------------

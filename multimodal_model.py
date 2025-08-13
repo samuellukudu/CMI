@@ -44,6 +44,10 @@ class MultiModalConfig:
     # Classification head
     num_classes: int = 17  # change to dataset gesture count
 
+    # Performance tweaks
+    # Freeze heavy TOF backbone by default to avoid backprop through EfficientNet
+    freeze_tof_backbone: bool = True
+
 
 # ---------------------------------------------------------------------------
 #  Model
@@ -61,6 +65,11 @@ class MultiModalTransformerClassifier(nn.Module):
         self.imu_encoder = BinaryIMUCNN(self.cfg.imu_cfg)
         self.thm_encoder = THMGRU(self.cfg.thm_cfg)
         self.tof_encoder = TOFEfficientNet(self.cfg.tof_cfg)
+
+        # Optionally freeze the heavy EfficientNet backbone to speed up training
+        if getattr(self.cfg, "freeze_tof_backbone", False):
+            for p in self.tof_encoder.backbone.parameters():
+                p.requires_grad = False
 
         latent_dim = self.cfg.imu_cfg.conv_channels[-1]  # IMU output dim
         assert (
@@ -115,6 +124,13 @@ class MultiModalTransformerClassifier(nn.Module):
 
     def _init_weights(self) -> None:
         nn.init.normal_(self.pos_emb, std=0.02)
+
+    def train(self, mode: bool = True):  # type: ignore[override]
+        """Ensure frozen TOF backbone stays in eval mode to avoid BN updates."""
+        super().train(mode)
+        if getattr(self.cfg, "freeze_tof_backbone", False):
+            self.tof_encoder.backbone.eval()
+        return self
 
 
 # ---------------------------------------------------------------------------
